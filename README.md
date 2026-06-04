@@ -180,4 +180,4 @@ Focused on applying artificial intelligence to scientific imaging, advanced inst
 
 LinkedIn: linkedin.com/in/physicskatt
 
-GitHub: github.com/PhysicsKatt
+GitHub: github.com/PhysicsKatt1
