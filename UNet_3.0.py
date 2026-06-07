@@ -28,109 +28,61 @@ from keras import ops
 ##### globals #####
 width = 512
 height = 442
-epochs = 10
+epochs = 5
 batch = 3
-learning_rate = 10e-5
+learning_rate = 10e-4
 model_name = 'UNet_3.1'
 path = r'/Users/trentstarkey/Desktop'
-sorted_path = path + '/TrainingData'
-sorted_path1 = path + '/ValData'
+sorted_path = path + '/TrainingData/30000.0V_0.09nA'
+sorted_path1 = path + '/ValData/30000.0V_0.09nA'
 test_path = path + '/TestData/Multifiducial_variableHFW/SortedJpegs'
 
-training_loss_list = []
-training_accuracy_list = []
-training_F1_list = []
-training_precision_list = []
-training_recall_list = []
-val_accuracy_list = []
-val_loss_list = []
-val_F1_list = []
-val_precision_list = []
-val_recall_list = []
-test_accuracy_list_in = []
-test_accuracy_list_not = []
-test_F1_list = []
-test_precision_list = []
-test_recall_list = []
-
 ##### define functions #####
-class CreateDatasets():
-    def extract_parent_features(self, file_paths):
-        parent_names = sorted(list(set(os.path.normpath(path).split(os.sep)[-3] for path in file_paths)))
-        parent_to_idx = {name: idx for idx, name in enumerate(parent_names)}
-
-        parents = []
-        for path in file_paths:
-            parent_folder = os.path.normpath(path).split(os.sep)[-3]
-            parents.append(tf.keras.utils.to_categorical(parent_to_idx[parent_folder],num_classes=len(parent_names)))
-
-        return np.asarray(parents, dtype=np.float32)
-
-    def add_parent_features(self,image_ds, parent_features):
-        parent_ds = tf.data.Dataset.from_tensor_slices(parent_features).batch(batch)
-        dataset = tf.data.Dataset.zip((image_ds, parent_ds))
-
-        return dataset
-
-    def mapper(data, parents):
-        images, labels = data
-
-        return ({'image': images, 'parents': parents}, labels)
-
+class CreateDatasets():    
     def create_datasets(self):
-        for file in os.listdir(sorted_path):
-            img_training = tf.keras.utils.image_dataset_from_directory(
-                sorted_path + '/' + file,
-                labels='inferred',
-                color_mode='grayscale',
-                seed=1,
-                validation_split=0.2,
-                subset='training',
-                shuffle=False,
-                image_size=(height, width),
-                batch_size=batch)
+        img_training = tf.keras.utils.image_dataset_from_directory(sorted_path,
+            labels='inferred',
+            color_mode='grayscale',
+            seed=1,
+            validation_split=0.2,
+            subset='training',
+            shuffle=True,
+            image_size=(height, width),
+            batch_size=batch, 
+            label_mode = 'categorical')
 
-            parents = self.extract_parent_features(img_training.file_paths)
-            img_training = self.add_parent_features(img_training, parents)
+        img_val = tf.keras.utils.image_dataset_from_directory(sorted_path,
+            labels='inferred',
+            color_mode='grayscale',
+            seed=1,
+            validation_split=0.2,
+            subset='validation',
+            shuffle=True,
+            image_size=(height, width),
+            batch_size=batch,
+            label_mode = 'categorical')
 
-            img_val = tf.keras.utils.image_dataset_from_directory(
-                sorted_path + '/' + file,
-                labels='inferred',
-                color_mode='grayscale',
-                seed=1,
-                validation_split=0.2,
-                subset='validation',
-                shuffle=False,
-                image_size=(height, width),
-                batch_size=batch)
-
-            parents = self.extract_parent_features(img_val.file_paths)
-            img_val = self.add_parent_features(img_val, parents)
-
-        for file in os.listdir(sorted_path1):
-            img_val1 = tf.keras.utils.image_dataset_from_directory(
-                sorted_path1 + '/' + file,
-                labels='inferred',
-                color_mode='grayscale',
-                seed=1,
-                validation_split=0.8,
-                subset='validation',
-                shuffle=False,
-                image_size=(height, width),
-                batch_size=batch)
-
-            parents = self.extract_parent_features(img_val1.file_paths)
-            img_val1 = self.add_parent_features(img_val1, parents)
+        img_val1 = tf.keras.utils.image_dataset_from_directory(sorted_path1,
+            labels='inferred',
+            color_mode='grayscale',
+            seed=1,
+            validation_split=0.2,
+            subset='validation',
+            shuffle=True,
+            image_size=(height, width),
+            batch_size=batch,
+            label_mode = 'categorical')
 
         return img_training, img_val, img_val1
     
     def optimize_data(self, img_training, img_val, img_val1):
         print('Optimizing datasets.')
         AUTOTUNE = tf.data.AUTOTUNE
+        cache_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        img_training = img_training.prefetch(AUTOTUNE)
-        img_val = img_val.prefetch(AUTOTUNE)
-        img_val1 = img_val1.prefetch(AUTOTUNE)
+        img_training = img_training.cache().prefetch(AUTOTUNE)
+        img_val = img_val.cache(f'/tmp/img_val_cache_{cache_id}').prefetch(AUTOTUNE)
+        img_val1 = img_val1.cache(f'/tmp/img_val1_cache_{cache_id}').prefetch(AUTOTUNE)
 
         return img_training, img_val, img_val1
 
@@ -205,7 +157,7 @@ class CreateModel():
     def create_model(self, num_labels):
         num_labels = num_labels
         inputs = tf.keras.Input(shape=(height, width, 1), batch_size=batch, name = 'image')
-        parents = tf.keras.Input(shape=(3,), name= 'parents')
+        # parents = tf.keras.Input(shape=(3,), name= 'parents')
         norm = tf.keras.layers.Rescaling(1 / 255., 0.)(inputs)
 
         x = layers.ZeroPadding2D((1, 1))(norm)
@@ -269,12 +221,12 @@ class CreateModel():
 
         x = layers.GlobalAveragePooling2D(keepdims=True)(x)
         x = layers.Flatten()(x)
-        x = layers.Concatenate()([x, parents])
+        # x = layers.Concatenate()([x, parents])
         x= layers.Dense(2048, activation='relu', kernel_regularizer=tf.keras.regularizers.l1_l2(0.01, 0.01))(x) 
         x= layers.Dense(1024, activation='relu')(x)
-        output = layers.Dense(num_labels, activation='softmax')(x)
+        output = layers.Dense(2, activation='softmax')(x)
 
-        net = tf.keras.Model(inputs={'image': inputs, 'parents': parents},outputs=output)
+        net = tf.keras.Model(inputs=inputs,outputs=output)
 
         return net
 
@@ -288,8 +240,8 @@ class CreateModel():
         all_val_data = tf.data.Dataset.concatenate(val_data, val_data1)
 
         model.compile(loss = Loss(), optimizer = optimizer, metrics = [metric_accuracy, metric_F1, metric_precision, metric_recall])
-        history = model.fit(training_data, batch_size = batch,  validation_data = all_val_data, 
-                            epochs = epochs, class_weight = {0: 0.7, 1: 0.3})
+        history = model.fit(training_data, batch_size = batch,  validation_data = all_val_data.take(100), 
+                            steps_per_epoch = 30, epochs = epochs, class_weight = {0: 0.7, 1: 0.3})
         
         model.save(path + '/' + model_name + '.keras')
         
