@@ -28,9 +28,9 @@ from keras import ops
 ##### globals #####
 width = 512
 height = 442
-epochs = 5
+epochs = 8
 batch = 3
-learning_rate = 10e-4
+learning_rate = 10e-5
 model_name = 'UNet_3.1'
 path = r'/Users/trentstarkey/Desktop'
 sorted_path = path + '/TrainingData/30000.0V_0.09nA'
