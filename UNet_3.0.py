@@ -28,9 +28,9 @@ from keras import ops
 ##### globals #####
 width = 512
 height = 442
-epochs = 8
+epochs = 10
 batch = 3
-learning_rate = 10e-5
+learning_rate = 10e-4
 model_name = 'UNet_3.1'
 path = r'/Users/trentstarkey/Desktop'
 sorted_path = path + '/TrainingData/30000.0V_0.09nA'
@@ -161,14 +161,14 @@ class CreateModel():
         norm = tf.keras.layers.Rescaling(1 / 255., 0.)(inputs)
 
         x = layers.ZeroPadding2D((1, 1))(norm)
-        x = layers.SeparableConv2D(256, (3, 3))(x)
+        x = layers.SeparableConv2D(128, (3, 3))(x)
         x = Exp_relu(leak = 0)(x)
         x = layers.MaxPooling2D(pool_size=(2, 2))(x)
         x = layers.BatchNormalization()(x)
     
         activation = x
 
-        for filter in [256, 64, 8]:
+        for filter in [128, 64, 8]:
             x = layers.ZeroPadding2D((1, 1))(x)
             x = layers.SeparableConv2D(filter, (3, 3))(x)
             x = Exp_relu(leak = 0)(x)
@@ -222,7 +222,7 @@ class CreateModel():
         x = layers.GlobalAveragePooling2D(keepdims=True)(x)
         x = layers.Flatten()(x)
         # x = layers.Concatenate()([x, parents])
-        x= layers.Dense(2048, activation='relu', kernel_regularizer=tf.keras.regularizers.l1_l2(0.01, 0.01))(x) 
+        x= layers.Dense(2048, activation='relu', kernel_regularizer=tf.keras.regularizers.l1_l2(0.1, 0.01))(x) 
         x= layers.Dense(1024, activation='relu')(x)
         output = layers.Dense(2, activation='softmax')(x)
 
@@ -240,8 +240,8 @@ class CreateModel():
         all_val_data = tf.data.Dataset.concatenate(val_data, val_data1)
 
         model.compile(loss = Loss(), optimizer = optimizer, metrics = [metric_accuracy, metric_F1, metric_precision, metric_recall])
-        history = model.fit(training_data, batch_size = batch,  validation_data = all_val_data.take(100), 
-                            steps_per_epoch = 30, epochs = epochs, class_weight = {0: 0.7, 1: 0.3})
+        history = model.fit(training_data, batch_size = batch,  validation_data = all_val_data.take(200), 
+                             steps_per_epoch = 30, epochs = epochs, class_weight = {0: 0.7, 1: 0.3})
         
         model.save(path + '/' + model_name + '.keras')
         
