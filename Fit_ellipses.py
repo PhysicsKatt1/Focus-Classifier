@@ -21,7 +21,7 @@ path = r'//Users/trentstarkey/Desktop'
 inputs = '/Offsets_all'
 outputs = '/Offsets_FFTs'
 test = '/Offsets_Test'
-boarder_crop = 40
+boarder_crop = 3
 sigX = 28
 sigY = 28
 av_mean = 1e-05
@@ -54,10 +54,10 @@ class PrepareImages():
     def crop_DC(self):
         im_arr = cv2.normalize(np.array(self.im), None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F)
         im_arr  = im_arr[boarder_crop:-boarder_crop, boarder_crop:-boarder_crop]
-        background = cv2.GaussianBlur(im_arr, (0, 0), sigmaX = sigX, sigmaY = sigY) 
-        im_arr = (im_arr - background)* np.mean(im_arr)
+        background = cv2.GaussianBlur(im_arr, (0, 0), sigmaX = sigX, sigmaY = sigY)
+        im_arr = (im_arr - background)
         im_arr = im_arr / np.max(im_arr)
-        im_arr = im_arr - (np.mean(im_arr) - av_mean)
+        # im_arr = im_arr - (np.mean(im_arr) - av_mean)
         
         return im_arr
 
@@ -65,14 +65,14 @@ class PrepareImages():
         im = np.fft.fft2(image)
         im = np.fft.fftshift(im)
         im = np.log1p(np.abs(im))
+        im = im - (np.mean(im) - av_mean)
 
         return im
     
     def denoise(self, image):
-        im = image
         h, w = image.shape
         hc, wc = h//2, w//2 
-        im = im[hc - 125: hc + 125, wc - 125: wc + 125]
+        im = image[hc - 128: hc + 128, wc - 128: wc + 128] 
    
         return im
 
@@ -152,41 +152,22 @@ class FitEllipses():
         counts = np.bincount(radius.ravel())
         amp = amp /counts
         freq = np.arange(radius.max() + 1)
-        peaks, _ = find_peaks(amp, prominence = 1.5, distance = 5) 
-
+        
+        peaks, _ = find_peaks(amp, prominence = 0.05, distance = 5)
         amp = amp/max(amp)
+
         widths, width_heights, left_ips, right_ips = peak_widths(amp, peaks, rel_height=0.5)
 
         return amp, freq, peaks, widths
     
-    def plot_masked_frequency(self, idx50):
-        cy, cx = self.im.shape[0] // 2, self.im.shape[1] // 2
-        y, x = np.indices(self.im.shape)
-        radius = np.sqrt((x - cx)**2 + (y - cy)**2).astype(int)
-
-        mask = np.zeros(self.im.shape, dtype=bool)
-        rows, cols = np.unravel_index(idx50, self.im.shape)
-        mask[rows, cols] = True
-
-        amp = np.bincount(radius[mask], weights=self.im[mask])
-        counts = np.bincount(radius[mask])
-        amp_mask = amp / counts
-        freq_mask = np.arange(len(amp))
-
-        peaks_mask, _ = find_peaks(amp, prominence = 1.5, distance = 5)
-
-        amp_mask = amp_mask/max(amp_mask)
-
-        return amp_mask, freq_mask, peaks_mask
 
     def run(self):
         idx90, idx50, flat = self.thresholds()
         self.highlight50(idx50)
         ellipse_dict = self.ellipse50(idx50)
         amp, freqs, peaks, widths = self.plot_frequency()
-        amp_mask, freq_mask, peaks_mask = self.plot_masked_frequency(idx50)
         
-        return idx90, idx50, ellipse_dict, amp, freqs, peaks, amp_mask, freq_mask, peaks_mask, widths
+        return idx90, idx50, ellipse_dict, amp, freqs, peaks, widths
 
 ##### call functions #####
 meta = []
@@ -202,22 +183,35 @@ for file in os.listdir(path + inputs):
     count50 = []
     names2 = []
     profiles = []
-    profiles_mask = []
     fig, ax = plt.subplots(figsize = (6, 6))
 
-    for image in tqdm(os.listdir(path + inputs + '/' + file)):
-        if not image.endswith('.tif'):
-            continue
+    in_focus_fft = {}
+    image_list = [i for i in os.listdir(path + inputs + '/' + file)
+              if i.endswith('.tif')]
 
+    for image in image_list:
+        prep = PrepareImages(path + inputs + '/' + file + '/' + image)
+        metadata, im = prep.run()
+
+        if '0.0__0.0__0.0' in image:
+            metadata['Current'] = float(metadata['Current'])
+            metadata['Current'] = np.round(metadata['Current'] / 1e-11, 0) * 1e-11
+            in_focus_fft[metadata['Current']] = im.copy()
+
+    for image in tqdm(image_list):
         name = image.removesuffix('.tif')
         names.append(name)
     
         prep = PrepareImages(path + inputs + '/' + file + '/' + image)
         metadata, im = prep.run()
 
+        metadata['Current'] = float(metadata['Current'])
+        metadata['Current'] = np.round(metadata['Current'] / 1e-11, 0) * 1e-11
+        im = im - 0.5*in_focus_fft[metadata['Current']]
+
         ellipse = FitEllipses(im, name, metadata)
-        idx90, idx50, ellipse_dict, amp, freqs, peaks, amp_mask, freq_mask, peaks_mask, widths = ellipse.run()
-        
+        idx90, idx50, ellipse_dict, amp, freqs, peaks, widths = ellipse.run()
+  
         metadata = pd.DataFrame([metadata])
         
         metadata['Abs Offset'] = pd.to_numeric(metadata['Image'].str.split('__').str[1]).abs()
@@ -226,7 +220,7 @@ for file in os.listdir(path + inputs):
         offset =  int(metadata['Offset'].iloc[0].removesuffix('.0'))
         metadata['Offset'] = offset
         
-        metadata['Peak Width'] = widths
+        metadata['Peak Width'] = widths[0] if len(widths) else np.nan
         ellipse_df = pd.DataFrame([ellipse_dict])
         ellipse_df['File'] = file
 
@@ -239,11 +233,9 @@ for file in os.listdir(path + inputs):
         
         profiles.append({'Image': name, 'Offset': offset, 'Frequency': freqs, 'Amplitude': amp,
                          'File': file, 'Current': metadata['Current'].iloc[0]})
-        profiles_mask.append({'Image': name, 'Offset': offset, 'Frequency': freq_mask, 
-                              'Amplitude': amp_mask, 'File': file, 'Current': metadata['Current'].iloc[0]})
         
-        # plt.imsave(path + outputs + '/' + file + '/' + name + '.png', im, cmap = 'gray')
-        # plt.close()
+        plt.imsave(path + outputs + '/' + file + '/' + name + '.png', im, cmap = 'gray')
+        plt.close()
   
     count_df = pd.DataFrame({'Image': names2, 'Pixels 90': count90, 'Pixels 50': count50})
     count_df.to_csv(path + outputs + '/' + file + '/' + file + '.csv')
@@ -264,21 +256,11 @@ for file in os.listdir(path + inputs):
     p1 = sns.relplot(kind = 'line', data = all_profiles, x = 'Frequency', y = 'Amplitude', col = 'Current', hue = 'Offset',
                 palette = palette)
     p1.set_xlabels('')
+    p1.figure.subplots_adjust(top=0.84)
     p1.figure.text(0.5, 0.015, 'Frequency', ha = 'center', va = 'center')
     plt.suptitle('Beam Profiles from Whole FFT Intensity \n Sample: ' + sample, x = 0.5, y = 0.99, ha = 'center')
     plt.savefig(path + outputs + '/' + file + '_profileFWHM_' + sample + '.png', bbox_inches = 'tight')
     plt.close()
-
-    # all_profiles_mask = pd.DataFrame(profiles_mask)
-    # all_profiles_mask = all_profiles_mask.explode(['Frequency', 'Amplitude'], ignore_index = True)
-    # all_profiles_mask['Frequency'] = pd.to_numeric(all_profiles_mask['Frequency'])
-    # all_profiles_mask['Amplitude'] = pd.to_numeric(all_profiles_mask['Amplitude'])
-    # p2 = sns.relplot(kind = 'line', data = all_profiles_mask, x = 'Frequency', y = 'Amplitude', col = 'Current', hue = 'Offset',
-    #              palette = 'tab20')
-    # p2.set_titles('')
-    # plt.suptitle('Beam Profile from Cropped FFT Intensity', ha = 'center')
-    # plt.tight_layout()
-    # plt.savefig(path + outputs + '/' + file + '_profile50_mask.png')
 
 ##### predict defocus offset from peak width #####
 all_metadata = pd.concat(meta, ignore_index=True)
@@ -298,7 +280,7 @@ g = sns.relplot(data = data, x = 'Offset', y = 'Peak Width', col = 'Current', hu
 g.set_xlabels('')
 for ax in g.axes.flat:
     ax.set_xticks([-50, -30, -10, 10, 30, 50])
-
+g.figure.subplots_adjust(top=0.84)
 g.figure.text(0.5, 0.015, 'Offset', ha = 'center', va = 'center')
 plt.suptitle('Prominent Peak Width by Offset \n Sample: ' + sample)
 plt.savefig(path + outputs + '/Peak_Intensity_Width_by_Offset_' + sample + '.png', bbox_inches = 'tight')
@@ -309,6 +291,7 @@ data = data[data['Offset'] >= 0]
 
 zero_map = (data.loc[data['Offset'] == 0].set_index(['File', 'Current'])['Peak Width'])
 data['Zero Offset Peak Width'] = data.set_index(['File', 'Current']).index.map(zero_map)
+data['Zero Offset Peak Width Mean']  = data.groupby('Current')['Zero Offset Peak Width'].transform('mean')
 data['File'] = pd.to_numeric(data['File'])
 
 grouped_data = data.groupby(['File', 'Current'])
@@ -323,6 +306,7 @@ for (current, file), group in grouped_data:
 
 regression_data = pd.DataFrame(regression_data)
 regression_data['Slope Mean']  = regression_data.groupby('Current')['Slope'].transform('mean')
+regression_data['Intercept Mean']  = regression_data.groupby('Current')['Intercept'].transform('mean')
 
 regression_data['Current'] = regression_data['Current'].astype(float)
 data['Current'] = data['Current'].astype(float)
@@ -331,7 +315,7 @@ regression_data = regression_data.merge(data, on = ['File', 'Current'], how = 'l
 regression_data['Current'] = np.round(regression_data['Current'] / 1e-11, 0) * 1e-11
 
 regression_data['Pred Offset'] = ((regression_data['Peak Width'] - 
-                                        regression_data['Zero Offset Peak Width']) / regression_data['Slope Mean'])*np.exp(-0.3) 
+                                        regression_data['Zero Offset Peak Width Mean']) / regression_data['Slope Mean']) 
 regression_data['Prediction Error'] = np.abs(regression_data['Pred Offset'] - regression_data['Offset'])
 regression_data['Error Bin'] = pd.cut(regression_data['Prediction Error'], bins = error_bins, include_lowest = True,
                                 right = False)
@@ -339,12 +323,18 @@ regression_data.to_csv(path + outputs + '/regression_data_' + sample + '.csv')
 
 regression_data = regression_data[regression_data['Offset'] > 0]
 
-mod_df = (regression_data.drop_duplicates(subset='Current')[['Current', 'Slope Mean']].reset_index(drop=True))
+mod_df0 = (regression_data.drop_duplicates(subset='Current')[['Current', 'Slope Mean',
+                                                             'Intercept Mean']].reset_index(drop=True))
+data['Current'] = np.round(data['Current'] / 1e-11, 0) * 1e-11
+mod_df1 = (data.drop_duplicates(subset='Current')[['Current', 'Zero Offset Peak Width Mean']].reset_index(drop=True))
+mod_df = pd.merge(mod_df0, mod_df1, on = 'Current')
+
 mod_df.to_csv(path + outputs + '/model_vals_' + sample + '.csv')
 
 fig, ax = plt.subplots(figsize=(8, 10))
 p = sns.relplot(data = regression_data, x = 'Offset', y = 'Pred Offset', hue = 'Error Bin', col = 'Current', palette = 'cool')
 p.set_xlabels('')
+p.figure.subplots_adjust(top=0.84)
 p.figure.text(0.5, 0.015, 'Absolute Offset', ha = 'center', va = 'center')
 plt.suptitle('Predicted vs Absolute Offset \n Sample: ' + sample)
 plt.savefig(path + outputs + '/regression_results_' + sample + '.png', bbox_inches = 'tight')
@@ -372,7 +362,7 @@ for file in os.listdir(path + test):
         metadata, im = prep.run()
 
         ellipse = FitEllipses(im, name, metadata)
-        idx90, idx50, ellipse_dict, amp, freqs, peaks, amp_mask, freq_mask, peaks_mask, widths = ellipse.run()
+        idx90, idx50, ellipse_dict, amp, freqs, peaks, widths = ellipse.run()
 
         metadata = pd.DataFrame([metadata])
         metadata['Abs Offset'] = pd.to_numeric(metadata['Image'].str.split('__').str[1]).abs()
@@ -394,7 +384,7 @@ zero_map_test = (all_metadata_test.loc[all_metadata_test['Offset'] == 0].set_ind
 all_metadata_test['Zero Offset Peak Width'] = all_metadata_test.set_index(['File', 'Current']).index.map(zero_map_test)
 
 all_metadata_test['Pred Offset'] = (all_metadata_test['Peak Width'] - 
-                                     all_metadata_test['Zero Offset Peak Width']) / all_metadata_test['Slope Mean']
+                                     all_metadata_test['Zero Offset Peak Width Mean']) / all_metadata_test['Slope Mean']
 all_metadata_test['Prediction Error'] = np.abs(all_metadata_test['Pred Offset'] - all_metadata_test['Offset'])
 all_metadata_test['Error Bin'] = pd.cut(all_metadata_test['Prediction Error'], bins = error_bins, include_lowest = True,
                                     right = False)
@@ -405,7 +395,7 @@ all_metadata_test = all_metadata_test[all_metadata_test['Offset'] > 0]
 fig, ax = plt.subplots(figsize=(8, 10))
 p = sns.relplot(data = all_metadata_test, x = 'Offset', y = 'Pred Offset', hue = 'Error Bin', col = 'Current', palette = 'cool')
 p.set_xlabels('')
+p.figure.subplots_adjust(top=0.84)
 p.figure.text(0.5, 0.015, 'Absolute Offset', ha = 'center', va = 'center')
 plt.suptitle('Predicted Offset vs Absolute Offset from Test Data \n Model: ' + sample)
 plt.savefig(path + outputs + '/test_results_test_' + sample + '.png', bbox_inches = 'tight')
- 

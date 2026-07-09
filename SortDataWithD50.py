@@ -19,6 +19,7 @@ sorted_path = r'/home/kat/Data/SortedJpegs'
 trainAndValFolder = '/AllBeams'
 in_focus_path = sorted_path + '/In_focus'
 not_in_focus_path = sorted_path + '/Not_in_focus'
+regression_path = r'/Users/trentstarkey/Desktop/RegressionData_30kV_0.09nA'
 
 ##### functions #####
 def parse_tiff(image):
@@ -130,40 +131,49 @@ def expanded_image(image, d50_expected, d50_experimental):
     
     return im_out
 
-# image = Image.open(r'/home/kat/Data/Focus_data_30000.0V_0.09nA__5.0__0.06__0.06__2025_07_14__18_39_59.tif')
-# hfw, volt, amp = parse_tiff(image)
-# experimental_d50(image, hfw)
-
+##### call functions #####
 d50_list_expected = []
 d50_list = []
 beam_list = []
 im_list = []
+labels = []
 
 for subfolders in os.listdir(path + trainAndValFolder):
     for images, n in zip(os.listdir(path + trainAndValFolder + '/' + subfolders),
                              tqdm(range(len(os.listdir(path + trainAndValFolder + '/' + subfolders))))):
         im = Image.open(path + trainAndValFolder + '/' + subfolders + '/' + images)
-        print(im)
         images = images[:-4]
+
+        #--- uncomment to save training and val data for regression model ---#
+        hfw, volt, amp = parse_tiff(im)
+        name = images.removeprefix('Focus_data_30000.0V_0.09nA__')
+        _, x, y, z = name.split('__')
+
+        if float(y) == 0.0 and float(z) == 0.0:
+            im.save(regression_path + '/' + n + '.jpeg', format = 'JPEG')
+            labels.append({'Image': n, 'Voltage': volt, 'Current': amp, })
+
+            
+        #--- uncomment to save test data for classifier ---#
         # im_list.append(images)
         
+        #--- uncomment to include a d50 value in each image for the classifier ---#
         # hfw, volt, amp = parse_tiff(im)
-        
         # d50_expected = expected_d50(volt, amp)
         # d50_list_expected.append(d50_expected)
-        
         # d50 = experimental_d50(im, hfw)
         # d50_list.append(d50)
         
         # im_out = expanded_image(im, d50_expected, d50)
         # im_out = Image.fromarray(im_out)
         
+        #--- uncomment to save training and val data for classifier ---#
         # if '30000.0V_0.09nA__0.0__0.0__0.0_' in images:
-        if '30000.0V_0.75nA__0.0__0.0__0.0_' in images:
-            im.save(in_focus_path + '/' + images + '.jpeg')
+        # if '30000.0V_0.75nA__0.0__0.0__0.0_' in images:
+        #     im.save(in_focus_path + '/' + images + '.jpeg')
             # im_out.save(in_focus_path + '/' + images + '.jpeg')
-        else:
-            im.save(not_in_focus_path + '/'  + images + '.jpeg')
+        # else:
+        #     im.save(not_in_focus_path + '/'  + images + '.jpeg')
             # im_out.save(not_in_focus_path + '/'  + images + '.jpeg')
         
 # dataframe = pd.DataFrame({'d50_expected':d50_list_expected, 'd50':d50_list, 'im': im_list})
