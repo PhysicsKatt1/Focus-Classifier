@@ -97,7 +97,7 @@ class Exp_relu(layers.Layer):
         self.leak = leak
 
     def call(self, input):
-        return K.maximum(input * tf.exp(input), self.leak)
+        return keras.ops.maximum(input * tf.exp(input), self.leak)
 
     def get_config(self):
         return {'leak': self.leak}
