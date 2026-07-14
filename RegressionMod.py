@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
+from torch.utils.data import WeightedRandomSampler
 
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop'
@@ -17,7 +18,7 @@ image_dir = path + '/RegressionData_30kV_0.09nA'
 csv_file = path + '/RegressionData_30kV_0.09nA/labels.csv'
 
 batch = 5
-learning_rate = 1e-5
+learning_rate = 1e-6
 mod_name = '1.0'
 epochs = 8
 
@@ -42,7 +43,7 @@ class Data(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        label = torch.tensor(row['Defocus'],dtype=torch.float32)
+        label = torch.tensor(row['Defocus'], dtype=torch.float32)
 
         return image, label
 
@@ -54,7 +55,13 @@ def create_datasets():
 
     generator = torch.Generator().manual_seed(1)
     train_dataset, val_dataset = random_split( dataset, [train_size,val_size], generator = generator)
-    train_loader = DataLoader(train_dataset, batch_size = batch, shuffle=True)
+
+    train_labels = dataset.data.iloc[train_dataset.indices]['Defocus']
+    label_counts = train_labels.value_counts()
+    weights = train_labels.map(lambda x: 1.0 / np.sqrt(label_counts[x])).values
+    sampler = WeightedRandomSampler(weights = torch.DoubleTensor(weights), num_samples=len(train_dataset), replacement = True)
+    
+    train_loader = DataLoader(train_dataset, batch_size = batch, sampler = sampler)
     val_loader = DataLoader(val_dataset, batch_size = batch, shuffle=False)
 
     return train_loader, val_loader
@@ -62,25 +69,12 @@ def create_datasets():
 class ExpReLU(nn.Module):
        def forward(self, x):
             x = torch.maximum(x * torch.exp(torch.clamp(x, max = 10)), torch.tensor(0., device = x.device))
-            return x #torch.clamp(x, 0, 10)
-
-class SeparableConv(nn.Module):
-    def __init__(self, inp, out):
-        super().__init__()
-        
-        self.depthwise = nn.Conv2d(inp, inp, kernel_size = 3, padding = 0, groups = inp)
-        self.pointwise = nn.Conv2d(inp, out, kernel_size = 1)
-
-    def forward(self,x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-
-        return x
+            return x 
 
 class ResizeResidual(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.conv = SeparableConv(in_channels, out_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size = 3)
 
     def forward(self, x, target_size):
         x = self.conv(x)
@@ -118,27 +112,27 @@ class DefocusRegressionCNN(nn.Module):
         super().__init__()
 
         self.pad1 = nn.ZeroPad2d(1)
-        self.conv1 = SeparableConv(1,128)
+        self.conv1 = nn.Conv2d(1,128, kernel_size = 3)
         self.bn1 = nn.BatchNorm2d(128)
 
 
         self.pad2 = nn.ZeroPad2d(1)
-        self.conv2 = SeparableConv(128,128)
+        self.conv2 = nn.Conv2d(128,128, kernel_size = 3)
         self.bn2 = nn.BatchNorm2d(128)
 
 
         self.pad3 = nn.ZeroPad2d(1)
-        self.conv3 = SeparableConv(128,64)
+        self.conv3 = nn.Conv2d(128,64, kernel_size = 3)
         self.bn3 = nn.BatchNorm2d(64)
 
 
         self.pad4 = nn.ZeroPad2d(1)
-        self.conv4 = SeparableConv(64,8)
+        self.conv4 = nn.Conv2d(64,8, kernel_size = 3)
         self.bn4 = nn.BatchNorm2d(8)
 
-        self.res1 = SeparableConv(128,128)
-        self.res2 = SeparableConv(128,64)
-        self.res3 = SeparableConv(64,8)
+        self.res1 = nn.Conv2d(128,128, kernel_size = 3)
+        self.res2 = nn.Conv2d(128,64, kernel_size = 3)
+        self.res3 = nn.Conv2d(64,8, kernel_size = 3)
 
         self.decoder = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
         self.decoder_pool = nn.MaxPool2d(2)
@@ -253,9 +247,9 @@ class Trainer:
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.device = device
-        self.loss_fn = nn.TripletMarginLoss()
-        self.optimizer = torch.optim.LBFGS(self.model.parameters(), lr = learning_rate)
+        self.device = device    
+        self.loss_fn = nn.MSELoss()
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr = learning_rate)
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -270,30 +264,19 @@ class Trainer:
             if batch_idx >= max_steps:
                 break
 
+            self.optimizer.zero_grad()
+
             images = images.to(self.device)
-            labels = labels.to(self.device).unsqueeze(1)
-            # predictions = self.model(images)
-            # pred = torch.round(predictions * 10) / 10
-            # loss = self.loss_fn(predictions, labels)
+            labels = labels.to(self.device).unsqueeze(1).float()
+            # print(labels)
+            predictions = self.model(images)
+            # print(predictions)
+            loss = self.loss_fn(predictions, labels)
 
-            def closure():
-                self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
-                predictions = self.model(images)
-                loss = self.loss_fn(predictions, labels)
-
-                loss.backward()
-
-                return loss
-
-            for _ in range(10):
-                loss = self.optimizer.step(closure)
-
-            with torch.no_grad():
-                predictions = self.model(images)
-                pred = torch.round(predictions * 10) / 10
-
-            total_correct += (pred == labels).sum().item()
+            total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
             total_samples += labels.size(0)
             total_loss += loss.item()
                         
@@ -314,16 +297,15 @@ class Trainer:
                     break
 
                 images = images.to(self.device)
-                labels = labels.to(self.device)
+                labels = labels.to(self.device).float()
                 labels = labels.unsqueeze(1)
-
                 predictions = self.model(images)
-                pred = torch.round(predictions * 10) / 10
 
-                total_correct += (pred == labels).sum().item()
-                total_samples += labels.size(0)
                 loss = self.loss_fn(predictions, labels)
                 total_loss += loss.item()
+
+                total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
+                total_samples += labels.size(0)
 
             return total_loss / max_steps, total_correct / total_samples
 
