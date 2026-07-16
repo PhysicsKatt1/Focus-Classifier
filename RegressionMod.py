@@ -17,10 +17,10 @@ path = r'/Users/trentstarkey/Desktop'
 image_dir = path + '/RegressionData_30kV_0.09nA'
 csv_file = path + '/RegressionData_30kV_0.09nA/labels.csv'
 
-batch = 5
+batch = 3
 learning_rate = 1e-6
 mod_name = '1.0'
-epochs = 8
+epochs = 12
 
 ##### define functions #####
 class Data(Dataset):
@@ -248,13 +248,13 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device    
-        self.loss_fn = nn.MSELoss()
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr = learning_rate)
+        self.loss_fn = nn.CosineEmbeddingLoss()
+        self.optimizer = torch.optim.Adafactor(self.model.parameters(), lr = learning_rate)
 
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
-        max_steps = 30
+        max_steps = 60
         total_correct = 0
         total_samples = 0
 
@@ -268,9 +268,9 @@ class Trainer:
 
             images = images.to(self.device)
             labels = labels.to(self.device).unsqueeze(1).float()
-            # print(labels)
+            print(labels)
             predictions = self.model(images)
-            # print(predictions)
+            print(predictions)
             loss = self.loss_fn(predictions, labels)
 
             loss.backward()
@@ -300,6 +300,7 @@ class Trainer:
                 labels = labels.to(self.device).float()
                 labels = labels.unsqueeze(1)
                 predictions = self.model(images)
+                # print(predictions)
 
                 loss = self.loss_fn(predictions, labels)
                 total_loss += loss.item()
