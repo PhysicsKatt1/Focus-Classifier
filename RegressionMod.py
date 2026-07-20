@@ -11,16 +11,19 @@ from torchvision import transforms
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 from torch.utils.data import WeightedRandomSampler
+from torch.profiler import profile, ProfilerActivity
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop'
 image_dir = path + '/RegressionData_30kV_0.09nA'
 csv_file = path + '/RegressionData_30kV_0.09nA/labels.csv'
 
-batch = 3
-learning_rate = 1e-6
+batch = 6
+learning_rate = 1e-5
 mod_name = '1.0'
-epochs = 12
+epochs = 11
 
 ##### define functions #####
 class Data(Dataset):
@@ -57,12 +60,17 @@ def create_datasets():
     train_dataset, val_dataset = random_split( dataset, [train_size,val_size], generator = generator)
 
     train_labels = dataset.data.iloc[train_dataset.indices]['Defocus']
-    label_counts = train_labels.value_counts()
-    weights = train_labels.map(lambda x: 1.0 / np.sqrt(label_counts[x])).values
-    sampler = WeightedRandomSampler(weights = torch.DoubleTensor(weights), num_samples=len(train_dataset), replacement = True)
+    train_counts = train_labels.value_counts()
+    train_weights = train_labels.map(lambda x: 1.0 / np.sqrt(train_counts[x])).values
+    sampler_train = WeightedRandomSampler(weights = torch.DoubleTensor(train_weights), num_samples=len(train_dataset), replacement = True)
     
-    train_loader = DataLoader(train_dataset, batch_size = batch, sampler = sampler)
-    val_loader = DataLoader(val_dataset, batch_size = batch, shuffle=False)
+    val_labels = dataset.data.iloc[val_dataset.indices]['Defocus']
+    val_counts = val_labels.value_counts()
+    val_weights = val_labels.map(lambda x: 1.0 / np.sqrt(val_counts[x])).values
+    sampler_val = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights), num_samples=len(val_dataset), replacement = True)
+
+    train_loader = DataLoader(train_dataset, batch_size = batch, sampler = sampler_train)
+    val_loader = DataLoader(val_dataset, batch_size = batch, sampler = sampler_val)
 
     return train_loader, val_loader
 
@@ -248,8 +256,17 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device    
-        self.loss_fn = nn.CosineEmbeddingLoss()
-        self.optimizer = torch.optim.Adafactor(self.model.parameters(), lr = learning_rate)
+        self.loss_fn = nn.HuberLoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr = learning_rate)
+        
+        self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.writer = SummaryWriter(log_dir=self.log_dir)
+        
+        try:
+            dummy_input = torch.randn(1,1,256,256).to(device)
+            self.writer.add_graph(self.model, dummy_input, use_strict = False)
+        except Exception as e:
+            print(f'TensorBoard graph skipped: {e}')
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -259,33 +276,39 @@ class Trainer:
         total_samples = 0
 
         progress = tqdm(enumerate(self.train_loader), total = max_steps, desc=f'Epoch {epoch+1}/{epochs}')
+        with profile(activities=[ProfilerActivity.CPU], schedule = torch.profiler.schedule(
+                    wait = 1, warmup = 1, active = 3, repeat = 1),
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(self.log_dir, 'profiler')),
+                    record_shapes = True, profile_memory = True, with_stack = True) as prof:
 
-        for batch_idx, (images, labels) in progress:
-            if batch_idx >= max_steps:
-                break
+            for batch_idx, (images, labels) in progress:
+                if batch_idx >= max_steps:
+                    break
 
-            self.optimizer.zero_grad()
+                self.optimizer.zero_grad()
 
-            images = images.to(self.device)
-            labels = labels.to(self.device).unsqueeze(1).float()
-            print(labels)
-            predictions = self.model(images)
-            print(predictions)
-            loss = self.loss_fn(predictions, labels)
+                images = images.to(self.device)
+                labels = labels.to(self.device).unsqueeze(1).float()
+                # print(labels)
+                predictions = self.model(images)
+                # print(predictions)
+                loss = self.loss_fn(predictions, labels)
 
-            loss.backward()
-            self.optimizer.step()
+                loss.backward()
+                self.optimizer.step()
 
-            total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
-            total_samples += labels.size(0)
-            total_loss += loss.item()
-                        
-        return total_loss / max_steps, total_correct / total_samples
+                total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
+                total_samples += labels.size(0)
+                total_loss += loss.item()
 
-    def validate(self):
+                prof.step()
+                            
+            return total_loss / max_steps, total_correct / total_samples
+
+    def validate(self, epoch):
         self.model.eval()
         total_loss = 0
-        max_steps = 30
+        max_steps = 60
         total_correct = 0
         total_samples = 0
 
@@ -299,8 +322,13 @@ class Trainer:
                 images = images.to(self.device)
                 labels = labels.to(self.device).float()
                 labels = labels.unsqueeze(1)
+                # print(labels)
                 predictions = self.model(images)
                 # print(predictions)
+
+                if batch_idx == 0:
+                    self.writer.add_histogram('Predictions', predictions.detach().cpu(), epoch)
+                    self.writer.add_histogram('Labels', labels.detach().cpu(), epoch)
 
                 loss = self.loss_fn(predictions, labels)
                 total_loss += loss.item()
@@ -310,20 +338,30 @@ class Trainer:
 
             return total_loss / max_steps, total_correct / total_samples
 
-    def fit(self, epochs, save_path = f'RegressionMod_{mod_name}'):
+    def fit(self, epochs, save_path=f'RegressionMod_{mod_name}'):
         best_val_loss = np.inf
 
         for epoch in range(epochs):
             train_loss, train_accuracy = self.train_epoch(epoch)
-            val_loss, val_accuracy = self.validate()
+            val_loss, val_accuracy = self.validate(epoch)
 
-            print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}', 
-                  f'Train Loss: {train_loss:.6f} ', f'Val Accuracy: {val_accuracy}', 
-                  f'Val Loss: {val_loss:.6f}')
+            print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}',
+                f'Train Loss: {train_loss:.6f}', f'Val Accuracy: {val_accuracy}', f'Val Loss: {val_loss:.6f}')
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save(self.model.state_dict(), save_path)
+
+            self.writer.add_scalar('Loss/train', train_loss, epoch)
+            self.writer.add_scalar('Loss/validation', val_loss, epoch)
+            self.writer.add_scalar('Accuracy/train', train_accuracy, epoch)
+            self.writer.add_scalar('Accuracy/validation', val_accuracy, epoch)
+
+            lr = self.optimizer.param_groups[0]['lr']
+            self.writer.add_scalar('Learning Rate', lr, epoch)
+
+        self.writer.flush()
+        self.writer.close()
 
 if __name__ == "__main__":
     torch.mps.empty_cache()
