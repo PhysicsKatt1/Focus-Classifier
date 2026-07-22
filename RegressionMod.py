@@ -20,10 +20,10 @@ path = r'/Users/trentstarkey/Desktop'
 image_dir = path + '/RegressionData_30kV_0.09nA'
 csv_file = path + '/RegressionData_30kV_0.09nA/labels.csv'
 
-batch = 6
-learning_rate = 1e-5
+batch = 20
+learning_rate = 1e-8
 mod_name = '1.0'
-epochs = 11
+epochs = 12
 
 ##### define functions #####
 class Data(Dataset):
@@ -256,7 +256,7 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device    
-        self.loss_fn = nn.HuberLoss()
+        self.loss_fn = nn.TripletMarginLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr = learning_rate)
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -271,7 +271,7 @@ class Trainer:
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
-        max_steps = 60
+        max_steps = 100
         total_correct = 0
         total_samples = 0
 
@@ -308,7 +308,7 @@ class Trainer:
     def validate(self, epoch):
         self.model.eval()
         total_loss = 0
-        max_steps = 60
+        max_steps = 100
         total_correct = 0
         total_samples = 0
 
