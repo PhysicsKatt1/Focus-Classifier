@@ -14,15 +14,14 @@ warnings.filterwarnings("ignore")
 
 # ##### globals #####
 path = r'/Users/trentstarkey/Desktop' 
-train_and_val_inputs = r'/Volumes/ThruFocusData/ThruFocusData/30kV90pA/TrainingData/RawImages_variableHFW_variableScanRes'
-train_and_val_outputs = r'/RegressionData_30kV_0.09nA'
+train_and_val_inputs = r'/Volumes/ThruFocusData/Raw Images/30kV90pA/ValData/RawImages_variableHFW'
+train_and_val_outputs = r'/RegressionData_30kV_0.09nA_val'
 
 os.makedirs(path + train_and_val_outputs, exist_ok=True)
 
 ##### functions #####
 def parse_tiff(image):
     meta_list = []
-    volt_list = []
     tags = image.tag.items()
     for item in tags:
         meta_list.append(item[1][0])

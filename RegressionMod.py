@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
-from torch.utils.data import WeightedRandomSampler
+from torch.utils.data import WeightedRandomSampler, ConcatDataset
 from torch.profiler import profile, ProfilerActivity
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
@@ -18,12 +18,14 @@ from datetime import datetime
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop'
 image_dir = path + '/RegressionData_30kV_0.09nA'
+val_dir = path + '/RegressionData_30kV_0.09nA_val'
 csv_file = path + '/RegressionData_30kV_0.09nA/labels.csv'
+csv_file_val = path + '/RegressionData_30kV_0.09nA_val/labels.csv'
 
-batch = 6
-learning_rate = 1e-5
-mod_name = '1.0'
-epochs = 11
+batch = 19
+learning_rate = 1e-2
+mod_name = '2.0'
+epochs = 15
 
 ##### define functions #####
 class Data(Dataset):
@@ -52,25 +54,39 @@ class Data(Dataset):
 
 def create_datasets():
     transform = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor()])
+    generator = torch.Generator().manual_seed(1)
+    
     dataset = Data(image_dir = image_dir, csv_file = csv_file, transform = transform)
+    dataset1 = Data(image_dir = val_dir, csv_file = csv_file_val, transform = transform)
+    
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
 
-    generator = torch.Generator().manual_seed(1)
-    train_dataset, val_dataset = random_split( dataset, [train_size,val_size], generator = generator)
+    train_size1 = int(0.8 * len(dataset1))
+    val_size1= len(dataset1) - train_size1
+    
+    train_dataset, val_dataset = random_split( dataset, [train_size, val_size], generator = generator)
+    _, val_dataset1 = random_split(dataset1, [val_size1, train_size1], generator = generator)
 
     train_labels = dataset.data.iloc[train_dataset.indices]['Defocus']
     train_counts = train_labels.value_counts()
     train_weights = train_labels.map(lambda x: 1.0 / np.sqrt(train_counts[x])).values
     sampler_train = WeightedRandomSampler(weights = torch.DoubleTensor(train_weights), num_samples=len(train_dataset), replacement = True)
-    
+
     val_labels = dataset.data.iloc[val_dataset.indices]['Defocus']
     val_counts = val_labels.value_counts()
     val_weights = val_labels.map(lambda x: 1.0 / np.sqrt(val_counts[x])).values
     sampler_val = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights), num_samples=len(val_dataset), replacement = True)
+    
+    val_labels1 = dataset1.data.iloc[val_dataset1.indices]['Defocus']
+    val_counts1 = val_labels1.value_counts()
+    val_weights1 = val_labels1.map(lambda x: 1.0 / np.sqrt(val_counts1[x])).values
+    sampler_val1 = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights1), num_samples=len(val_dataset1), replacement = True)
 
     train_loader = DataLoader(train_dataset, batch_size = batch, sampler = sampler_train)
-    val_loader = DataLoader(val_dataset, batch_size = batch, sampler = sampler_val)
+    val_loader0 = DataLoader(val_dataset, batch_size = batch, sampler = sampler_val)
+    val_loader1 = DataLoader(val_dataset1, batch_size = batch, sampler = sampler_val)
+    val_loader = ConcatDataset([val_loader0, val_loader1])
 
     return train_loader, val_loader
 
@@ -256,26 +272,27 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device    
-        self.loss_fn = nn.HuberLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr = learning_rate)
+        self.loss_fn = nn.L1Loss()
+        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr = learning_rate)
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir)
         
         try:
             dummy_input = torch.randn(1,1,256,256).to(device)
-            self.writer.add_graph(self.model, dummy_input, use_strict = False)
+            self.writer.add_graph(self.model, dummy_input) # use_strict = False
         except Exception as e:
             print(f'TensorBoard graph skipped: {e}')
 
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
-        max_steps = 60
+        max_steps = 300
         total_correct = 0
         total_samples = 0
 
         progress = tqdm(enumerate(self.train_loader), total = max_steps, desc=f'Epoch {epoch+1}/{epochs}')
+        
         with profile(activities=[ProfilerActivity.CPU], schedule = torch.profiler.schedule(
                     wait = 1, warmup = 1, active = 3, repeat = 1),
                     on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(self.log_dir, 'profiler')),
@@ -308,7 +325,7 @@ class Trainer:
     def validate(self, epoch):
         self.model.eval()
         total_loss = 0
-        max_steps = 60
+        max_steps = 30
         total_correct = 0
         total_samples = 0
 
