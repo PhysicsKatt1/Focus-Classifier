@@ -14,8 +14,8 @@ warnings.filterwarnings("ignore")
 
 # ##### globals #####
 path = r'/Users/trentstarkey/Desktop' 
-train_and_val_inputs = r'/Volumes/ThruFocusData/Raw Images/30kV90pA/ValData/RawImages_variableHFW'
-train_and_val_outputs = r'/RegressionData_30kV_0.09nA_val'
+train_and_val_inputs = r'/Volumes/ThruFocusData/ThruFocusData/30kV90pA/TestData/Multifiducial_variableHFW/RawImages'
+train_and_val_outputs = r'/RegressionData_30kV_0.09nA_test'
 
 os.makedirs(path + train_and_val_outputs, exist_ok=True)
 
@@ -47,15 +47,18 @@ for subfolders in os.listdir(train_and_val_inputs):
         im = Image.open(train_and_val_inputs + '/' + subfolders + '/' + images)
         images = images[:-4]
 
-        hfw, volt, amp = parse_tiff(im)
-        name = images.removeprefix('Focus_data_30000.0V_0.09nA__')
-        defocus, stigx, stigy, _, _ = name.split('__')
+        try:
+            hfw, volt, amp = parse_tiff(im)
+            name = images.removeprefix('Focus_data_30000.0V_0.09nA__')
+            defocus, stigx, stigy, _, _ = name.split('__')
 
-        if float(stigx) == 0.0 and float(stigy) == 0.0:
-            im_count += 1
-            
-            im.save(path + train_and_val_outputs + '/' + str(im_count) + '.jpeg', format = 'JPEG')
-            labels.append({'Image': str(im_count), 'Voltage': volt, 'Current': amp, 'Defocus': defocus, 'StigX': stigx, 'StigY': stigy})
-
+            if float(stigx) == 0.0 and float(stigy) == 0.0:
+                im_count += 1
+                
+                im.save(path + train_and_val_outputs + '/' + str(im_count) + '.jpeg', format = 'JPEG')
+                labels.append({'Image': str(im_count), 'Voltage': volt, 'Current': amp, 'Defocus': defocus, 'StigX': stigx, 'StigY': stigy})
+        
+        except:
+            continue
 all_labels = pd.DataFrame(labels)
 all_labels.to_csv(path + train_and_val_outputs + '/labels.csv')

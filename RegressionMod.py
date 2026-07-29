@@ -14,6 +14,7 @@ from torch.utils.data import WeightedRandomSampler, ConcatDataset
 from torch.profiler import profile, ProfilerActivity
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
 
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop'
@@ -26,6 +27,8 @@ batch = 19
 learning_rate = 1e-2
 mod_name = '2.0'
 epochs = 15
+
+USE_PROFILER = False
 
 ##### define functions #####
 class Data(Dataset):
@@ -65,29 +68,29 @@ def create_datasets():
     train_size1 = int(0.8 * len(dataset1))
     val_size1= len(dataset1) - train_size1
     
-    train_dataset, val_dataset = random_split( dataset, [train_size, val_size], generator = generator)
+    train_dataset, val_dataset0 = random_split( dataset, [train_size, val_size], generator = generator)
     _, val_dataset1 = random_split(dataset1, [val_size1, train_size1], generator = generator)
+    val_dataset = ConcatDataset([val_dataset0, val_dataset1])
 
     train_labels = dataset.data.iloc[train_dataset.indices]['Defocus']
     train_counts = train_labels.value_counts()
     train_weights = train_labels.map(lambda x: 1.0 / np.sqrt(train_counts[x])).values
     sampler_train = WeightedRandomSampler(weights = torch.DoubleTensor(train_weights), num_samples=len(train_dataset), replacement = True)
 
-    val_labels = dataset.data.iloc[val_dataset.indices]['Defocus']
-    val_counts = val_labels.value_counts()
-    val_weights = val_labels.map(lambda x: 1.0 / np.sqrt(val_counts[x])).values
-    sampler_val = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights), num_samples=len(val_dataset), replacement = True)
-    
+    val_labels0 = dataset.data.iloc[val_dataset0.indices]['Defocus']
+    val_counts0 = val_labels0.value_counts()
+    val_weights0 = val_labels0.map(lambda x: 1.0 / np.sqrt(val_counts0[x])).values
+
     val_labels1 = dataset1.data.iloc[val_dataset1.indices]['Defocus']
     val_counts1 = val_labels1.value_counts()
     val_weights1 = val_labels1.map(lambda x: 1.0 / np.sqrt(val_counts1[x])).values
-    sampler_val1 = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights1), num_samples=len(val_dataset1), replacement = True)
 
+    val_weights = np.concatenate([val_weights0, val_weights1])
+    sampler_val = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights), num_samples=len(val_dataset), replacement=True)
+    
     train_loader = DataLoader(train_dataset, batch_size = batch, sampler = sampler_train)
-    val_loader0 = DataLoader(val_dataset, batch_size = batch, sampler = sampler_val)
-    val_loader1 = DataLoader(val_dataset1, batch_size = batch, sampler = sampler_val)
-    val_loader = ConcatDataset([val_loader0, val_loader1])
-
+    val_loader = DataLoader(val_dataset, batch_size = batch, sampler = sampler_val)
+    
     return train_loader, val_loader
 
 class ExpReLU(nn.Module):
@@ -293,12 +296,36 @@ class Trainer:
 
         progress = tqdm(enumerate(self.train_loader), total = max_steps, desc=f'Epoch {epoch+1}/{epochs}')
         
-        with profile(activities=[ProfilerActivity.CPU], schedule = torch.profiler.schedule(
-                    wait = 1, warmup = 1, active = 3, repeat = 1),
-                    on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(self.log_dir, 'profiler')),
-                    record_shapes = True, profile_memory = True, with_stack = True) as prof:
+        if USE_PROFILER == True:
+            with profile(activities=[ProfilerActivity.CPU], schedule = torch.profiler.schedule(
+                        wait = 1, warmup = 1, active = 3, repeat = 1),
+                        on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(self.log_dir, 'profiler')),
+                        record_shapes = True, profile_memory = True, with_stack = True) as prof:
 
-            for batch_idx, (images, labels) in progress:
+                for batch_idx, (images, labels) in progress:
+                    if batch_idx >= max_steps:
+                        break
+
+                    self.optimizer.zero_grad()
+
+                    images = images.to(self.device)
+                    labels = labels.to(self.device).unsqueeze(1).float()
+                    # print(labels)
+                    predictions = self.model(images)
+                    # print(predictions)
+                    loss = self.loss_fn(predictions, labels)
+
+                    loss.backward()
+                    self.optimizer.step()
+
+                    total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
+                    total_samples += labels.size(0)
+                    total_loss += loss.item()
+
+                    prof.step()
+            
+        else:
+             for batch_idx, (images, labels) in progress:
                 if batch_idx >= max_steps:
                     break
 
@@ -317,10 +344,8 @@ class Trainer:
                 total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
                 total_samples += labels.size(0)
                 total_loss += loss.item()
-
-                prof.step()
                             
-            return total_loss / max_steps, total_correct / total_samples
+        return total_loss / max_steps, total_correct / total_samples
 
     def validate(self, epoch):
         self.model.eval()
