@@ -26,7 +26,7 @@ csv_file_val = path + '/RegressionData_30kV_0.09nA_val/labels.csv'
 batch = 19
 learning_rate = 1e-2
 mod_name = '2.0'
-epochs = 15
+epochs = 8
 
 USE_PROFILER = False
 
@@ -68,14 +68,21 @@ def create_datasets():
     train_size1 = int(0.8 * len(dataset1))
     val_size1= len(dataset1) - train_size1
     
-    train_dataset, val_dataset0 = random_split( dataset, [train_size, val_size], generator = generator)
-    _, val_dataset1 = random_split(dataset1, [val_size1, train_size1], generator = generator)
+    train_dataset0, val_dataset0 = random_split( dataset, [train_size, val_size], generator = generator)
+    train_dataset1, val_dataset1 = random_split(dataset1, [train_size1, val_size1], generator = generator)
+    train_dataset = ConcatDataset([train_dataset0, train_dataset1])
     val_dataset = ConcatDataset([val_dataset0, val_dataset1])
 
-    train_labels = dataset.data.iloc[train_dataset.indices]['Defocus']
-    train_counts = train_labels.value_counts()
-    train_weights = train_labels.map(lambda x: 1.0 / np.sqrt(train_counts[x])).values
-    sampler_train = WeightedRandomSampler(weights = torch.DoubleTensor(train_weights), num_samples=len(train_dataset), replacement = True)
+    train_labels0 = dataset.data.iloc[train_dataset0.indices]['Defocus']
+    train_counts0 = train_labels0.value_counts()
+    train_weights0 = train_labels0.map(lambda x: 1.0 / np.sqrt(train_counts0[x])).values
+
+    train_labels1 = dataset1.data.iloc[train_dataset1.indices]['Defocus']
+    train_counts1 = train_labels1.value_counts()
+    train_weights1 = train_labels1.map(lambda x: 1.0 / np.sqrt(train_counts1[x])).values
+
+    train_weights = np.concatenate([train_weights0, train_weights1])
+    sampler_train = WeightedRandomSampler(weights = torch.DoubleTensor(train_weights), num_samples=len(train_dataset), replacement=True)
 
     val_labels0 = dataset.data.iloc[val_dataset0.indices]['Defocus']
     val_counts0 = val_labels0.value_counts()
@@ -86,7 +93,7 @@ def create_datasets():
     val_weights1 = val_labels1.map(lambda x: 1.0 / np.sqrt(val_counts1[x])).values
 
     val_weights = np.concatenate([val_weights0, val_weights1])
-    sampler_val = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights), num_samples=len(val_dataset), replacement=True)
+    sampler_val = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights), num_samples=len(val_dataset), replacement=False)
     
     train_loader = DataLoader(train_dataset, batch_size = batch, sampler = sampler_train)
     val_loader = DataLoader(val_dataset, batch_size = batch, sampler = sampler_val)
@@ -290,7 +297,7 @@ class Trainer:
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
-        max_steps = 300
+        max_steps = 500
         total_correct = 0
         total_samples = 0
 
@@ -350,7 +357,7 @@ class Trainer:
     def validate(self, epoch):
         self.model.eval()
         total_loss = 0
-        max_steps = 30
+        max_steps = 200
         total_correct = 0
         total_samples = 0
 
