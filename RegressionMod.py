@@ -21,6 +21,8 @@ image_dir = path + '/RegressionData_30kV_0.09nA'
 val_dir = path + '/RegressionData_30kV_0.09nA_val'
 csv_file = path + '/RegressionData_30kV_0.09nA/labels.csv'
 csv_file_val = path + '/RegressionData_30kV_0.09nA_val/labels.csv'
+test_dir = path + '/RegressionData_30kV_0.09nA_test'
+csv_file_test = path + '/RegressionData_30kV_0.09nA_test/labels.csv'
 
 batch = 19
 learning_rate = 1e-2
@@ -66,25 +68,25 @@ def create_datasets():
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
 
-    train_size1 = int(0.5 * len(dataset1))
+    train_size1 = int(0.9 * len(dataset1))
     val_size1= len(dataset1) - train_size1
     
     #------ create random samplers to ensure even data representation ------#
     train_dataset0, val_dataset0 = random_split(dataset, [train_size, val_size], generator = generator)
     train_dataset1, val_dataset1 = random_split(dataset1, [train_size1, val_size1], generator = generator)
     val_dataset = ConcatDataset([val_dataset0, val_dataset1])
-    train_dataset = ConcatDataset([train_dataset0, train_dataset1])
+    # train_dataset = ConcatDataset([train_dataset0, train_dataset1])
     
     train_labels0 = dataset.data.iloc[train_dataset0.indices]['Defocus']
     train_counts0 = train_labels0.value_counts()
     train_weights0 = train_labels0.map(lambda x: 1.0 / np.sqrt(train_counts0[x])).values
 
-    train_labels1 = dataset1.data.iloc[train_dataset1.indices]['Defocus']
-    train_counts1 = train_labels1.value_counts()
-    train_weights1 = train_labels1.map(lambda x: 1.0 / np.sqrt(train_counts1[x])).values
+    # train_labels1 = dataset1.data.iloc[train_dataset1.indices]['Defocus']
+    # train_counts1 = train_labels1.value_counts()
+    # train_weights1 = train_labels1.map(lambda x: 1.0 / np.sqrt(train_counts1[x])).values
     
-    train_weights = ConcatDataset([train_weights0, train_weights1])
-    sampler_train = WeightedRandomSampler(weights = torch.DoubleTensor(train_weights), num_samples=len(train_dataset), replacement = True)
+    # train_weights = np.concatenate([train_weights0, train_weights1])
+    sampler_train = WeightedRandomSampler(weights = torch.DoubleTensor(train_weights0), num_samples=len(train_dataset0), replacement = True)
 
     val_labels0 = dataset.data.iloc[val_dataset0.indices]['Defocus']
     val_counts0 = val_labels0.value_counts()
@@ -94,11 +96,11 @@ def create_datasets():
     val_counts1 = val_labels1.value_counts()
     val_weights1 = val_labels1.map(lambda x: 1.0 / np.sqrt(val_counts1[x])).values
     
-    val_weights = ConcatDataset([val_weights0 , val_weights1])
+    val_weights = np.concatenate([val_weights0 , val_weights1])
     sampler_val = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights), num_samples=len(val_dataset), replacement = False)
 
     #----- create final dataloaders -----#
-    train_loader = DataLoader(train_dataset, batch_size = batch, sampler = sampler_train)
+    train_loader = DataLoader(train_dataset0, batch_size = batch, sampler = sampler_train)
     val_loader = DataLoader(val_dataset, batch_size = batch, sampler = sampler_val)
 
     return train_loader, val_loader
@@ -410,6 +412,19 @@ class Trainer:
         self.writer.flush()
         self.writer.close()
 
+def predict_image(model, image_path, device):
+    transform = transforms.Compose([transforms.Resize((256, 256)), transforms.ToTensor()])
+    image = Image.open(image_path).convert('L')
+    image = transform(image).unsqueeze(0).to(device)
+
+    model.eval()
+
+    with torch.no_grad():
+        prediction = model(image)
+
+    return prediction.item()
+
+##### train and validate model #####
 if __name__ == "__main__":
     torch.mps.empty_cache()
     train_loader, val_loader = create_datasets()
@@ -419,3 +434,33 @@ if __name__ == "__main__":
     trainer = Trainer(model=model, train_loader = train_loader, val_loader = val_loader,
         device=device, learning_rate = learning_rate)
     trainer.fit(epochs = epochs, save_path=f'RegressionMod_{mod_name}.pt')
+
+##### test model #####
+device = ('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+model = DefocusRegressionCNN().to(device)
+model.load_state_dict(torch.load('RegressionMod_2.0.pt', map_location = device))
+labels = pd.read_csv(csv_file_test)
+accuracy_defocus_stig = 0
+accuracy_defocus_only = 0
+
+progress = tqdm(enumerate(labels), total = len(labels), desc = 'Test')
+for image, label, lx, ly in zip(os.listdir(test_dir), labels['Defocus'], labels['StigX'], labels['StigY']):
+    progress.update(1)
+    if 'csv' in image:
+        continue
+    image_path = test_dir + '/' + image
+    prediction = predict_image(model, image_path, device)
+
+    if abs(prediction - label) <= 5:
+        accuracy_defocus_stig += 1
+    
+        if lx == 0 and ly == 0:
+            accuracy_defocus_only += 1
+
+progress.close()
+
+total_accuracy_defocus_stig = accuracy_defocus_stig/(len(labels))
+total_accuracy_defocus = accuracy_defocus_only/(((labels['StigX'] == 0) & (labels['StigY'] == 0)).sum())
+
+print(f'Accuracy for all images: {total_accuracy_defocus_stig}')
+print(f'Accuracy for defocused images: {total_accuracy_defocus}')
