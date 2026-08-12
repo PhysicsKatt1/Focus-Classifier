@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
-from torch.utils.data import WeightedRandomSampler, ConcatDataset
+from torch.utils.data import WeightedRandomSampler, ConcatDataset, Subset
 from torch.profiler import profile, ProfilerActivity
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
@@ -24,10 +24,10 @@ csv_file_val = path + '/RegressionData_30kV_0.09nA_val/labels.csv'
 test_dir = path + '/RegressionData_30kV_0.09nA_test'
 csv_file_test = path + '/RegressionData_30kV_0.09nA_test/labels.csv'
 
-batch = 19
-learning_rate = 1e-2
+batch = 5
+learning_rate = 3e-3
 mod_name = '2.0'
-epochs = 15
+epochs = 17
 
 USE_PROFILER = False
 
@@ -63,30 +63,40 @@ def create_datasets():
     #----- create datasets -----#
     dataset = Data(image_dir = image_dir, csv_file = csv_file, transform = transform)
     dataset1 = Data(image_dir = val_dir, csv_file = csv_file_val, transform = transform)
+    indices = torch.randperm(len(dataset1), generator = generator).tolist()
     
-    #----- create training and validation splits -----#
+    #----- create training and val split -----#
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
-
-    train_size1 = int(0.9 * len(dataset1))
-    val_size1= len(dataset1) - train_size1
     
-    #------ create random samplers to ensure even data representation ------#
     train_dataset0, val_dataset0 = random_split(dataset, [train_size, val_size], generator = generator)
-    train_dataset1, val_dataset1 = random_split(dataset1, [train_size1, val_size1], generator = generator)
-    val_dataset = ConcatDataset([val_dataset0, val_dataset1])
-    # train_dataset = ConcatDataset([train_dataset0, train_dataset1])
     
+    #----- create secondary training and val split -----#
+    train_fraction1 = 0.01
+    val_fraction1 = 0.7
+    
+    train_size1 = int(train_fraction1 * len(dataset1))
+    val_size1 = int(val_fraction1 * len(dataset1))
+
+    train_indices1 = indices[:train_size1]
+    val_indices1 = indices[train_size1:train_size1 + val_size1]
+    train_dataset1 = Subset(dataset1, train_indices1)
+    val_dataset1 = Subset(dataset1, val_indices1)
+    
+    val_dataset = ConcatDataset([val_dataset0, val_dataset1])
+    train_dataset = ConcatDataset([train_dataset0, train_dataset1])
+
+    #------ create random samplers to ensure even data representation ------#
     train_labels0 = dataset.data.iloc[train_dataset0.indices]['Defocus']
     train_counts0 = train_labels0.value_counts()
     train_weights0 = train_labels0.map(lambda x: 1.0 / np.sqrt(train_counts0[x])).values
 
-    # train_labels1 = dataset1.data.iloc[train_dataset1.indices]['Defocus']
-    # train_counts1 = train_labels1.value_counts()
-    # train_weights1 = train_labels1.map(lambda x: 1.0 / np.sqrt(train_counts1[x])).values
+    train_labels1 = dataset1.data.iloc[train_dataset1.indices]['Defocus']
+    train_counts1 = train_labels1.value_counts()
+    train_weights1 = train_labels1.map(lambda x: 1.0 / np.sqrt(train_counts1[x])).values
     
-    # train_weights = np.concatenate([train_weights0, train_weights1])
-    sampler_train = WeightedRandomSampler(weights = torch.DoubleTensor(train_weights0), num_samples=len(train_dataset0), replacement = True)
+    train_weights = np.concatenate([train_weights0, train_weights1])
+    sampler_train = WeightedRandomSampler(weights = torch.DoubleTensor(train_weights), num_samples=len(train_dataset), replacement = True)
 
     val_labels0 = dataset.data.iloc[val_dataset0.indices]['Defocus']
     val_counts0 = val_labels0.value_counts()
@@ -100,8 +110,8 @@ def create_datasets():
     sampler_val = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights), num_samples=len(val_dataset), replacement = False)
 
     #----- create final dataloaders -----#
-    train_loader = DataLoader(train_dataset0, batch_size = batch, sampler = sampler_train)
-    val_loader = DataLoader(val_dataset, batch_size = batch, sampler = sampler_val)
+    train_loader = DataLoader(train_dataset, batch_size = batch, sampler = sampler_train)
+    val_loader = DataLoader(val_dataset, batch_size = batch, sampler = sampler_val, shuffle = False)
 
     return train_loader, val_loader
 
@@ -284,7 +294,8 @@ class Trainer:
         self.val_loader = val_loader
         self.device = device    
         self.loss_fn = nn.L1Loss()
-        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr = learning_rate)
+        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr = learning_rate, lr_decay = 0,
+                                             weight_decay = 0) 
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir)
@@ -357,7 +368,7 @@ class Trainer:
     def validate(self, epoch):
         self.model.eval()
         total_loss = 0
-        max_steps = 100
+        max_steps = 70
         total_correct = 0
         total_samples = 0
 
