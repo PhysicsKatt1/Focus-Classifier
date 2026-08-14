@@ -14,6 +14,7 @@ from torch.utils.data import WeightedRandomSampler, ConcatDataset, Subset
 from torch.profiler import profile, ProfilerActivity
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+import torchvision.transforms as T
 
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop'
@@ -24,10 +25,10 @@ csv_file_val = path + '/RegressionData_30kV_0.09nA_val/labels.csv'
 test_dir = path + '/RegressionData_30kV_0.09nA_test'
 csv_file_test = path + '/RegressionData_30kV_0.09nA_test/labels.csv'
 
-batch = 5
-learning_rate = 3e-3
+batch = 12
+learning_rate = 1e-2
 mod_name = '2.0'
-epochs = 17
+epochs = 30
 
 USE_PROFILER = False
 
@@ -72,8 +73,8 @@ def create_datasets():
     train_dataset0, val_dataset0 = random_split(dataset, [train_size, val_size], generator = generator)
     
     #----- create secondary training and val split -----#
-    train_fraction1 = 0.01
-    val_fraction1 = 0.7
+    train_fraction1 = 0.1
+    val_fraction1 = 0.4
     
     train_size1 = int(train_fraction1 * len(dataset1))
     val_size1 = int(val_fraction1 * len(dataset1))
@@ -120,20 +121,18 @@ class ExpReLU(nn.Module):
             x = torch.maximum(x * torch.exp(torch.clamp(x, max = 10)), torch.tensor(0., device = x.device))
             return x 
 
-class ResizeResidual(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size = 3)
-
-    def forward(self, x, target_size):
-        x = self.conv(x)
-        x = F.interpolate(x, size = target_size, mode = 'bilinear', align_corners = False)
-
-        return x
-
-class FFTShift(nn.Module):
+class FFT(nn.Module):
     def forward(self, x):
-        return torch.fft.fftshift(x)
+        x = x[:, :, 3:-3, 3:-3]
+        background = T.GaussianBlur((1, 1), sigma = (28, 28))
+        background_x = background(x)
+        x = (x - background_x)
+        x = x / (torch.amax(x, dim=(-2, -1), keepdim=True) + 1e-8)
+
+        x = torch.fft.fft2(x)
+        x = torch.fft.fftshift(x, dim=(-2, -1))
+
+        return torch.log1p(torch.abs(x))
 
 class IFFTShift(nn.Module):
     def forward(self, x):
@@ -159,52 +158,38 @@ class Patches(nn.Module):
 class DefocusRegressionCNN(nn.Module):
     def __init__(self):
         super().__init__()
+        self.expRELU = ExpReLU()
+
         self.pad1 = nn.ZeroPad2d(1)
-        self.conv1 = nn.Conv2d(1,128, kernel_size = 3)
-        self.bn1 = nn.BatchNorm2d(128)
+        self.conv1 = nn.Conv2d(1,16, kernel_size = 3)
+        self.bn1 = nn.BatchNorm2d(16)
 
         self.pad2 = nn.ZeroPad2d(1)
-        self.conv2 = nn.Conv2d(128,128, kernel_size = 3)
-        self.bn2 = nn.BatchNorm2d(128)
+        self.conv2 = nn.Conv2d(16,32, kernel_size = 3)
+        self.bn2 = nn.BatchNorm2d(32)
 
-        self.pad3 = nn.ZeroPad2d(1)
-        self.conv3 = nn.Conv2d(128,64, kernel_size = 3)
-        self.bn3 = nn.BatchNorm2d(64)
+        self.res1 = nn.Conv2d(16,32, kernel_size = 3, padding = 1)
 
-        self.pad4 = nn.ZeroPad2d(1)
-        self.conv4 = nn.Conv2d(64,8, kernel_size = 3)
-        self.bn4 = nn.BatchNorm2d(8)
+        self.dropout = nn.Dropout(0.05)
 
-        self.res1 = nn.Conv2d(128,128, kernel_size = 3)
-        self.res2 = nn.Conv2d(128,64, kernel_size = 3)
-        self.res3 = nn.Conv2d(64,8, kernel_size = 3)
+        self.fft = FFT()
+        self.fft_conv1= nn.Conv2d(32, 128, kernel_size = 1)
+        self.fft_conv2= nn.Conv2d(128, 256, kernel_size = 1)
+        self.bn3 = nn.BatchNorm2d(256)
 
-        self.decoder = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
-        self.decoder_pool = nn.MaxPool2d(2)
-        self.decoder_up = nn.Upsample(scale_factor = 2, mode = 'bilinear', align_corners = False)
-        self.bn5 = nn.BatchNorm2d(36)
+        self.fft_res = nn.Conv2d(32, 256, kernel_size = 1)
 
-        self.res_up = nn.Upsample(scale_factor = 2, mode = 'bilinear', align_corners = False)
-        self.decoder_res = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
+        self.ifft_shift = IFFTShift()
 
         self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.lin1 = nn.Linear(128, 2048)
+        self.lin1 = nn.Linear(256, 2048)
         self.lin2 = nn.Linear(2048, 1024)
         self.output = nn.Linear(1024,1)
-        self.act = ExpReLU()
-        self.patches = Patches(patch_size = 4, resize_x = 200, resize_y = 200)
-        self.fft_shift = FFTShift()
-        self.ifft_shift = IFFTShift()
-        self.patch_conv = nn.Conv2d(in_channels = 576, out_channels = 64, kernel_size = 1)
-        self.patch_res = nn.Conv2d(in_channels = 8, out_channels = 64, kernel_size = 1)
-        self.fft_conv= nn.Conv2d(in_channels = 64, out_channels = 128, kernel_size = 1)
-        self.fft_res = nn.Conv2d(in_channels = 64, out_channels = 128, kernel_size = 1)
-        self.dropout = nn.Dropout(0.05)
 
     def forward(self,x):
         x = self.pad1(x)
         x = self.conv1(x)
-        x = self.act(x)
+        x = self.expRELU(x)
         x = F.max_pool2d(x,2)
         x = self.bn1(x)
 
@@ -212,7 +197,7 @@ class DefocusRegressionCNN(nn.Module):
 
         x = self.pad2(x)
         x = self.conv2(x)
-        x = self.act(x)
+        x = self.expRELU(x)
         x = F.max_pool2d(x,2)
         x = self.bn2(x)
 
@@ -222,58 +207,18 @@ class DefocusRegressionCNN(nn.Module):
         x = x + res
         activation = x
 
-        x = self.pad3(x)
-        x = self.conv3(x)
-        x = self.act(x)
+        x = self.dropout(x)
+
+        x = self.fft(x)
+        x = self.fft_conv1(x)
+        x = self.expRELU(x)
+        x = self.fft_conv2(x)
+        x = self.expRELU(x)
         x = F.max_pool2d(x,2)
         x = self.bn3(x)
 
-        res = self.res2(activation)
-        res = F.interpolate(res, size = x.shape[2:], mode = 'bilinear', align_corners=False)
-
-        x = x + res
-        activation = x
-
-        x = self.pad4(x)
-        x = self.conv4(x)
-        x = self.act(x)
-        x = F.max_pool2d(x,2)
-        x = self.bn4(x)
-
-        res = self.res3(activation)
-        res = F.interpolate(res, size = x.shape[2:], mode = 'bilinear', align_corners = False)
-
-        x = x + res
-        activation = x
-
-        x = self.decoder(x)
-        x = self.act(x)
-        x = self.decoder_pool(x)
-        x = self.bn5(x)
-        x = self.decoder_up(x)
-
-        res = self.res_up(activation)
-        res = self.decoder_res(res)
-        res = F.interpolate(res, size = x.shape[2:], mode = 'bilinear', align_corners = False)
-
-        x = x + res
-
-        x = self.patches(x)
-        x = self.patch_conv(x)
-        x = F.relu(x)
-
-        res = self.patch_res(activation)
-        res = F.interpolate(res, size = x.shape[2:], mode = 'bilinear', align_corners = False)
-
-        x = x + res
-        activation = x
-
-        x = self.dropout(x)
-        x = self.fft_shift(x)
-        x = self.fft_conv(x)
-        x = F.relu(x)
-
         res = self.fft_res(activation)
+        res = F.interpolate(res, size = x.shape[2:], mode = 'bilinear', align_corners = False)
         x = x + res
         activation = x
 
@@ -294,8 +239,7 @@ class Trainer:
         self.val_loader = val_loader
         self.device = device    
         self.loss_fn = nn.L1Loss()
-        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr = learning_rate, lr_decay = 0,
-                                             weight_decay = 0) 
+        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr = learning_rate, lr_decay = 1e-6) 
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir)
@@ -368,7 +312,7 @@ class Trainer:
     def validate(self, epoch):
         self.model.eval()
         total_loss = 0
-        max_steps = 70
+        max_steps = 30
         total_correct = 0
         total_samples = 0
 
