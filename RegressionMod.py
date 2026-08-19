@@ -14,6 +14,7 @@ from torch.utils.data import WeightedRandomSampler, ConcatDataset, Subset
 from torch.profiler import profile, ProfilerActivity
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+import torchvision
 
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop'
@@ -24,10 +25,10 @@ csv_file_val = path + '/RegressionData_30kV_0.09nA_val/labels.csv'
 test_dir = path + '/RegressionData_30kV_0.09nA_test'
 csv_file_test = path + '/RegressionData_30kV_0.09nA_test/labels.csv'
 
-batch = 5
-learning_rate = 3e-3
+batch = 12
+learning_rate = 1e-2
 mod_name = '2.0'
-epochs = 17
+epochs = 30
 
 USE_PROFILER = False
 
@@ -72,8 +73,8 @@ def create_datasets():
     train_dataset0, val_dataset0 = random_split(dataset, [train_size, val_size], generator = generator)
     
     #----- create secondary training and val split -----#
-    train_fraction1 = 0.01
-    val_fraction1 = 0.7
+    train_fraction1 = 0.1 
+    val_fraction1 = 0.4   
     
     train_size1 = int(train_fraction1 * len(dataset1))
     val_size1 = int(val_fraction1 * len(dataset1))
@@ -131,10 +132,24 @@ class ResizeResidual(nn.Module):
 
         return x
 
-class FFTShift(nn.Module):
+class FFT(nn.Module):
     def forward(self, x):
-        return torch.fft.fftshift(x)
+        # x  = x[:, :, 3:-3, 3:-3]
+        # blur = torchvision.transforms.GaussianBlur(kernel_size = (1, 1), sigma = (28, 28))
+        # background = blur(x)
+        # x = (x - background)
+        # x = x / torch.max(x)
 
+        # x = torch.fft.fft2(x, norm = 'ortho')
+        # x = torch.fft.fftshift(x)
+        # x = torch.log1p(torch.abs(x))
+        # x = x - (torch.mean(x, dim=(-2, -1), keepdim=True) - 1e-05)
+
+        # h, w = x.shape[-2:]
+        # hc, wc = h//2, w//2 
+        # x = x[:, :, hc - 128: hc + 128, wc - 128: wc + 128] 
+        return torch.fft.fftshift(x)
+    
 class IFFTShift(nn.Module):
     def forward(self, x):
         return torch.fft.ifftshift(x)
@@ -159,6 +174,8 @@ class Patches(nn.Module):
 class DefocusRegressionCNN(nn.Module):
     def __init__(self):
         super().__init__()
+        self.act = ExpReLU()
+        
         self.pad1 = nn.ZeroPad2d(1)
         self.conv1 = nn.Conv2d(1,128, kernel_size = 3)
         self.bn1 = nn.BatchNorm2d(128)
@@ -167,40 +184,46 @@ class DefocusRegressionCNN(nn.Module):
         self.conv2 = nn.Conv2d(128,128, kernel_size = 3)
         self.bn2 = nn.BatchNorm2d(128)
 
+        self.res1 = nn.Conv2d(128,128, kernel_size = 3)
+
         self.pad3 = nn.ZeroPad2d(1)
         self.conv3 = nn.Conv2d(128,64, kernel_size = 3)
         self.bn3 = nn.BatchNorm2d(64)
 
+        self.res2 = nn.Conv2d(128,64, kernel_size = 3)
+        
         self.pad4 = nn.ZeroPad2d(1)
         self.conv4 = nn.Conv2d(64,8, kernel_size = 3)
         self.bn4 = nn.BatchNorm2d(8)
 
-        self.res1 = nn.Conv2d(128,128, kernel_size = 3)
-        self.res2 = nn.Conv2d(128,64, kernel_size = 3)
         self.res3 = nn.Conv2d(64,8, kernel_size = 3)
 
-        self.decoder = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
-        self.decoder_pool = nn.MaxPool2d(2)
-        self.decoder_up = nn.Upsample(scale_factor = 2, mode = 'bilinear', align_corners = False)
+        self.transpose = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
+        self.transpose_pool = nn.MaxPool2d(2)
+        self.transpose_up = nn.Upsample(scale_factor = 2, mode = 'bilinear', align_corners = False)
         self.bn5 = nn.BatchNorm2d(36)
 
         self.res_up = nn.Upsample(scale_factor = 2, mode = 'bilinear', align_corners = False)
-        self.decoder_res = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
+        self.transpose_res = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
+
+        self.patches = Patches(patch_size = 4, resize_x = 200, resize_y = 200)
+        self.patch_conv = nn.Conv2d(in_channels = 576, out_channels = 64, kernel_size = 1)
+
+        self.patch_res = nn.Conv2d(in_channels = 8, out_channels = 64, kernel_size = 1)
+       
+        self.dropout = nn.Dropout(0.05)
+        self.fft = FFT()
+        self.fft_conv= nn.Conv2d(in_channels = 64, out_channels = 128, kernel_size = 1)
+
+        self.fft_res = nn.Conv2d(in_channels = 64, out_channels = 128, kernel_size = 1)
+
+        self.ifft_shift = IFFTShift()
 
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.lin1 = nn.Linear(128, 2048)
         self.lin2 = nn.Linear(2048, 1024)
         self.output = nn.Linear(1024,1)
-        self.act = ExpReLU()
-        self.patches = Patches(patch_size = 4, resize_x = 200, resize_y = 200)
-        self.fft_shift = FFTShift()
-        self.ifft_shift = IFFTShift()
-        self.patch_conv = nn.Conv2d(in_channels = 576, out_channels = 64, kernel_size = 1)
-        self.patch_res = nn.Conv2d(in_channels = 8, out_channels = 64, kernel_size = 1)
-        self.fft_conv= nn.Conv2d(in_channels = 64, out_channels = 128, kernel_size = 1)
-        self.fft_res = nn.Conv2d(in_channels = 64, out_channels = 128, kernel_size = 1)
-        self.dropout = nn.Dropout(0.05)
-
+   
     def forward(self,x):
         x = self.pad1(x)
         x = self.conv1(x)
@@ -246,14 +269,14 @@ class DefocusRegressionCNN(nn.Module):
         x = x + res
         activation = x
 
-        x = self.decoder(x)
+        x = self.transpose(x)
         x = self.act(x)
-        x = self.decoder_pool(x)
+        x = self.transpose_pool(x)
         x = self.bn5(x)
-        x = self.decoder_up(x)
+        x = self.transpose_up(x)
 
         res = self.res_up(activation)
-        res = self.decoder_res(res)
+        res = self.transpose_res(res)
         res = F.interpolate(res, size = x.shape[2:], mode = 'bilinear', align_corners = False)
 
         x = x + res
@@ -269,7 +292,7 @@ class DefocusRegressionCNN(nn.Module):
         activation = x
 
         x = self.dropout(x)
-        x = self.fft_shift(x)
+        x = self.fft(x)
         x = self.fft_conv(x)
         x = F.relu(x)
 
@@ -294,8 +317,7 @@ class Trainer:
         self.val_loader = val_loader
         self.device = device    
         self.loss_fn = nn.L1Loss()
-        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr = learning_rate, lr_decay = 0,
-                                             weight_decay = 0) 
+        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr = learning_rate, lr_decay = 1e-6) # weight_decay = 0  
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir)
@@ -368,60 +390,95 @@ class Trainer:
     def validate(self, epoch):
         self.model.eval()
         total_loss = 0
-        max_steps = 70
+        max_steps = 30
         total_correct = 0
         total_samples = 0
 
         progress = tqdm(enumerate(self.val_loader), total = max_steps, desc = 'Validation')
 
-        with torch.no_grad():
-            for batch_idx, (images, labels) in progress:
-                if batch_idx >= max_steps:
-                    break
+        if USE_PROFILER == True:
+            with torch.no_grad():
+                for batch_idx, (images, labels) in progress:
+                    if batch_idx >= max_steps:
+                        break
 
-                images = images.to(self.device)
-                labels = labels.to(self.device).float()
-                labels = labels.unsqueeze(1)
-                # print(labels)
-                predictions = self.model(images)
-                # print(predictions)
+                    images = images.to(self.device)
+                    labels = labels.to(self.device).float()
+                    labels = labels.unsqueeze(1)
+                    # print(labels)
+                    predictions = self.model(images)
+                    # print(predictions)
 
-                if batch_idx == 0:
-                    self.writer.add_histogram('Predictions', predictions.detach().cpu(), epoch)
-                    self.writer.add_histogram('Labels', labels.detach().cpu(), epoch)
+                    if batch_idx == 0:
+                        self.writer.add_histogram('Predictions', predictions.detach().cpu(), epoch)
+                        self.writer.add_histogram('Labels', labels.detach().cpu(), epoch)
 
-                loss = self.loss_fn(predictions, labels)
-                total_loss += loss.item()
+                    loss = self.loss_fn(predictions, labels)
+                    total_loss += loss.item()
 
-                total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
-                total_samples += labels.size(0)
+                    total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
+                    total_samples += labels.size(0)
+
+        else:
+            with torch.no_grad():
+                for batch_idx, (images, labels) in progress:
+                    if batch_idx >= max_steps:
+                        break
+
+                    images = images.to(self.device)
+                    labels = labels.to(self.device).float()
+                    labels = labels.unsqueeze(1)
+                    # print(labels)
+                    predictions = self.model(images)
+                    # print(predictions)
+
+                    loss = self.loss_fn(predictions, labels)
+                    total_loss += loss.item()
+
+                    total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
+                    total_samples += labels.size(0)
 
             return total_loss / max_steps, total_correct / total_samples
 
     def fit(self, epochs, save_path=f'RegressionMod_{mod_name}'):
         best_val_loss = np.inf
 
-        for epoch in range(epochs):
-            train_loss, train_accuracy = self.train_epoch(epoch)
-            val_loss, val_accuracy = self.validate(epoch)
+        if USE_PROFILER == True:
+            for epoch in range(epochs):
+                train_loss, train_accuracy = self.train_epoch(epoch)
+                val_loss, val_accuracy = self.validate(epoch)
 
-            print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}',
-                f'Train Loss: {train_loss:.6f}', f'Val Accuracy: {val_accuracy}', f'Val Loss: {val_loss:.6f}')
+                print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}',
+                    f'Train Loss: {train_loss:.6f}', f'Val Accuracy: {val_accuracy}', f'Val Loss: {val_loss:.6f}')
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(self.model.state_dict(), save_path)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save(self.model.state_dict(), save_path)
 
-            self.writer.add_scalar('Loss/train', train_loss, epoch)
-            self.writer.add_scalar('Loss/validation', val_loss, epoch)
-            self.writer.add_scalar('Accuracy/train', train_accuracy, epoch)
-            self.writer.add_scalar('Accuracy/validation', val_accuracy, epoch)
+                self.writer.add_scalar('Loss/train', train_loss, epoch)
+                self.writer.add_scalar('Loss/validation', val_loss, epoch)
+                self.writer.add_scalar('Accuracy/train', train_accuracy, epoch)
+                self.writer.add_scalar('Accuracy/validation', val_accuracy, epoch)
 
-            lr = self.optimizer.param_groups[0]['lr']
-            self.writer.add_scalar('Learning Rate', lr, epoch)
+                lr = self.optimizer.param_groups[0]['lr']
+                self.writer.add_scalar('Learning Rate', lr, epoch)
 
-        self.writer.flush()
-        self.writer.close()
+            self.writer.flush()
+            self.writer.close()
+
+        else:
+             for epoch in range(epochs):
+                train_loss, train_accuracy = self.train_epoch(epoch)
+                val_loss, val_accuracy = self.validate(epoch)
+
+                print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}',
+                    f'Train Loss: {train_loss:.6f}', f'Val Accuracy: {val_accuracy}', f'Val Loss: {val_loss:.6f}')
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save(self.model.state_dict(), save_path)
+
+        return 
 
 def predict_image(model, image_path, device):
     transform = transforms.Compose([transforms.Resize((256, 256)), transforms.ToTensor()])
