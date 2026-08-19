@@ -28,9 +28,10 @@ csv_file_test = path + '/RegressionData_30kV_0.09nA_test/labels.csv'
 batch = 12
 learning_rate = 1e-2
 mod_name = '2.0'
-epochs = 30
+epochs = 10
 
 USE_PROFILER = False
+TOLERANCE = 3.0
 
 ##### define functions #####
 class Data(Dataset):
@@ -87,6 +88,7 @@ def create_datasets():
     val_dataset = ConcatDataset([val_dataset0, val_dataset1])
     train_dataset = ConcatDataset([train_dataset0, train_dataset1])
 
+    '''
     #------ create random samplers to ensure even data representation ------#
     train_labels0 = dataset.data.iloc[train_dataset0.indices]['Defocus']
     train_counts0 = train_labels0.value_counts()
@@ -109,10 +111,11 @@ def create_datasets():
     
     val_weights = np.concatenate([val_weights0 , val_weights1])
     sampler_val = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights), num_samples=len(val_dataset), replacement = False)
+    '''
 
     #----- create final dataloaders -----#
-    train_loader = DataLoader(train_dataset, batch_size = batch, sampler = sampler_train)
-    val_loader = DataLoader(val_dataset, batch_size = batch, sampler = sampler_val, shuffle = False)
+    train_loader = DataLoader(train_dataset, batch_size = batch)
+    val_loader = DataLoader(val_dataset, batch_size = batch, shuffle = False)
 
     return train_loader, val_loader
 
@@ -163,11 +166,19 @@ class Patches(nn.Module):
     def forward(self, x):
         return self.projection(x) 
 
-# Output: torch.Size([1, 196, 768])
-# class Loss(nn.Module):
-#     def forward(self, x):
-#         nn.L1Loss() + nn.MSELoss()
-#         return 
+class Loss(nn.Module):
+    def __init__(self, l1_weight=1.0, mse_weight=0.1):
+        super().__init__()
+        self.l1 = nn.L1Loss()
+        self.mse = nn.MSELoss()
+        self.l1_weight = l1_weight
+        self.mse_weight = mse_weight
+
+    def forward(self, predictions, targets):
+        l1_loss = self.l1(predictions, targets)
+        mse_loss = self.mse(predictions, targets)
+
+        return self.l1_weight * l1_loss + self.mse_weight * mse_loss
 
 class DefocusRegressionCNN(nn.Module):
     def __init__(self):
@@ -315,14 +326,14 @@ class Trainer:
         self.val_loader = val_loader
         self.device = device    
         self.loss_fn = nn.L1Loss()
-        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr = learning_rate, lr_decay = 1e-6) # weight_decay = 0  
+        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr = learning_rate, lr_decay = 1e-6)
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir)
         
         try:
             dummy_input = torch.randn(1,1,256,256).to(device)
-            self.writer.add_graph(self.model, dummy_input) # use_strict = False
+            self.writer.add_graph(self.model, dummy_input) 
         except Exception as e:
             print(f'TensorBoard graph skipped: {e}')
 
@@ -332,6 +343,7 @@ class Trainer:
         max_steps = 300
         total_correct = 0
         total_samples = 0
+        total_batches = 0
 
         progress = tqdm(enumerate(self.train_loader), total = max_steps, desc=f'Epoch {epoch+1}/{epochs}')
 
@@ -357,11 +369,14 @@ class Trainer:
                     loss.backward()
                     self.optimizer.step()
 
-                    total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
+                    total_correct += (torch.abs(predictions - labels) <= TOLERANCE).sum().item()
                     total_samples += labels.size(0)
                     total_loss += loss.item()
+                    total_batches += 1
 
                     prof.step()
+            return total_loss / total_batches, total_correct / total_samples
+
         else:
             for batch_idx, (images, labels) in progress:
                 if batch_idx >= max_steps:
@@ -379,27 +394,25 @@ class Trainer:
                 loss.backward()
                 self.optimizer.step()
 
-                total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
+                total_correct += (torch.abs(predictions - labels) <= TOLERANCE).sum().item()
                 total_samples += labels.size(0)
                 total_loss += loss.item()
+                total_batches += 1
                             
-            return total_loss / max_steps, total_correct / total_samples
+            return total_loss / total_batches, total_correct / total_samples
 
     def validate(self, epoch):
         self.model.eval()
         total_loss = 0
-        max_steps = 30
         total_correct = 0
         total_samples = 0
+        total_batches = 0
 
-        progress = tqdm(enumerate(self.val_loader), total = max_steps, desc = 'Validation')
+        progress = tqdm(enumerate(self.val_loader), desc = 'Validation') 
 
         if USE_PROFILER == True:
             with torch.no_grad():
                 for batch_idx, (images, labels) in progress:
-                    if batch_idx >= max_steps:
-                        break
-
                     images = images.to(self.device)
                     labels = labels.to(self.device).float()
                     labels = labels.unsqueeze(1)
@@ -414,14 +427,17 @@ class Trainer:
                     loss = self.loss_fn(predictions, labels)
                     total_loss += loss.item()
 
-                    total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
+                    total_correct += (torch.abs(predictions - labels) <= TOLERANCE).sum().item()
                     total_samples += labels.size(0)
+                    total_batches += 1
+
+            return total_loss / total_batches, total_correct / total_samples
 
         else:
             with torch.no_grad():
                 for batch_idx, (images, labels) in progress:
-                    if batch_idx >= max_steps:
-                        break
+                    # if batch_idx >= max_steps:
+                    #     break
 
                     images = images.to(self.device)
                     labels = labels.to(self.device).float()
@@ -433,10 +449,11 @@ class Trainer:
                     loss = self.loss_fn(predictions, labels)
                     total_loss += loss.item()
 
-                    total_correct += (torch.abs(predictions - labels) <= 5).sum().item()
+                    total_correct += (torch.abs(predictions - labels) <= TOLERANCE).sum().item()
                     total_samples += labels.size(0)
+                    total_batches += 1
 
-            return total_loss / max_steps, total_correct / total_samples
+            return total_loss / total_batches, total_correct / total_samples
 
     def fit(self, epochs, save_path=f'RegressionMod_{mod_name}'):
         best_val_loss = np.inf
@@ -463,6 +480,8 @@ class Trainer:
 
             self.writer.flush()
             self.writer.close()
+
+            return 
 
         else:
              for epoch in range(epochs):
@@ -504,29 +523,32 @@ if __name__ == "__main__":
 ##### test model #####
 device = ('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 model = DefocusRegressionCNN().to(device)
-model.load_state_dict(torch.load('RegressionMod_2.0.pt', map_location = device))
+model.load_state_dict(torch.load('RegressionMod_2.0.pt', map_location=device))
 labels = pd.read_csv(csv_file_test)
 accuracy_defocus_stig = 0
 accuracy_defocus_only = 0
 
-progress = tqdm(enumerate(labels), total = len(labels), desc = 'Test')
-for image, label, lx, ly in zip(os.listdir(test_dir), labels['Defocus'], labels['StigX'], labels['StigY']):
-    progress.update(1)
-    if 'csv' in image:
-        continue
-    image_path = test_dir + '/' + image
+progress = tqdm(labels.iterrows(), total=len(labels), desc='Test')
+
+for _, row in progress:
+    image = str(int(row['Image']))
+    image_path = test_dir + '/' + image + '.jpeg'
+    label = row['Defocus']
+    lx = row['StigX']
+    ly = row['StigY']
+
     prediction = predict_image(model, image_path, device)
 
-    if abs(prediction - label) <= 5:
+    if abs(prediction - label) <= 3:
         accuracy_defocus_stig += 1
-    
+
         if lx == 0 and ly == 0:
             accuracy_defocus_only += 1
 
 progress.close()
 
-total_accuracy_defocus_stig = accuracy_defocus_stig/(len(labels))
-total_accuracy_defocus = accuracy_defocus_only/(((labels['StigX'] == 0) & (labels['StigY'] == 0)).sum())
+total_accuracy_defocus_stig = accuracy_defocus_stig / len(labels)
+total_accuracy_defocus = accuracy_defocus_only / (((labels['StigX'] == 0) & (labels['StigY'] == 0)).sum())
 
 print(f'Accuracy for all images: {total_accuracy_defocus_stig}')
 print(f'Accuracy for defocused images: {total_accuracy_defocus}')
