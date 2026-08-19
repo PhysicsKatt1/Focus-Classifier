@@ -539,7 +539,7 @@ for _, row in progress:
 
     prediction = predict_image(model, image_path, device)
 
-    if abs(prediction - label) <= 3:
+    if abs(prediction - label) <= TOLERANCE:
         accuracy_defocus_stig += 1
 
         if lx == 0 and ly == 0:
