@@ -118,7 +118,7 @@ def create_datasets():
 
 class ExpReLU(nn.Module):
        def forward(self, x):
-            x = torch.maximum(x * torch.exp(torch.clamp(x, max = 10)), torch.tensor(0., device = x.device))
+            x = torch.clamp_min(x * torch.exp(torch.clamp(x, max = 10)), 0)
             return x 
 
 class ResizeResidual(nn.Module):
@@ -155,21 +155,19 @@ class IFFTShift(nn.Module):
         return torch.fft.ifftshift(x)
 
 class Patches(nn.Module):
-    def __init__(self, patch_size = 4, resize_x = 200, resize_y = 200):
+    def __init__(self, in_channels, patch_size, embed_dim ):
         super().__init__()
-        self.patch_size = patch_size
-        self.resize = nn.Upsample(size = (resize_x,resize_y), mode = 'bilinear', align_corners = False)
-
+        self.projection = nn.Conv2d(in_channels = in_channels, out_channels = embed_dim, 
+                                    kernel_size=patch_size, stride = patch_size)
+        
     def forward(self, x):
-        x = self.resize(x)
-        x = F.unfold(x, kernel_size = self.patch_size, stride = self.patch_size)
+        return self.projection(x) 
 
-        B, C, L = x.shape
-        h = 200 // self.patch_size
-        w = 200 // self.patch_size
-        x = x.view(B, C, h, w)
-
-        return x
+# Output: torch.Size([1, 196, 768])
+# class Loss(nn.Module):
+#     def forward(self, x):
+#         nn.L1Loss() + nn.MSELoss()
+#         return 
 
 class DefocusRegressionCNN(nn.Module):
     def __init__(self):
@@ -200,14 +198,14 @@ class DefocusRegressionCNN(nn.Module):
 
         self.transpose = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
         self.transpose_pool = nn.MaxPool2d(2)
-        self.transpose_up = nn.Upsample(scale_factor = 2, mode = 'bilinear', align_corners = False)
+        self.upsample = nn.Upsample(scale_factor = 2, mode = 'bilinear', align_corners = False)
         self.bn5 = nn.BatchNorm2d(36)
 
         self.res_up = nn.Upsample(scale_factor = 2, mode = 'bilinear', align_corners = False)
         self.transpose_res = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
 
-        self.patches = Patches(patch_size = 4, resize_x = 200, resize_y = 200)
-        self.patch_conv = nn.Conv2d(in_channels = 576, out_channels = 64, kernel_size = 1)
+        self.patches = Patches(in_channels = 8, patch_size = 4, embed_dim = 128)
+        self.patch_conv = nn.Conv2d(in_channels = 128, out_channels = 64, kernel_size = 1)
 
         self.patch_res = nn.Conv2d(in_channels = 8, out_channels = 64, kernel_size = 1)
        
@@ -269,17 +267,17 @@ class DefocusRegressionCNN(nn.Module):
         x = x + res
         activation = x
 
-        x = self.transpose(x)
-        x = self.act(x)
-        x = self.transpose_pool(x)
-        x = self.bn5(x)
-        x = self.transpose_up(x)
+        # x = self.transpose(x)
+        # x = self.act(x)
+        # x = self.transpose_pool(x)
+        # x = self.bn5(x)
+        # x = self.upsample(x)
 
-        res = self.res_up(activation)
-        res = self.transpose_res(res)
-        res = F.interpolate(res, size = x.shape[2:], mode = 'bilinear', align_corners = False)
+        # res = self.res_up(activation)
+        # res = self.transpose_res(res)
+        # res = F.interpolate(res, size = x.shape[2:], mode = 'bilinear', align_corners = False)
 
-        x = x + res
+        # x = x + res
 
         x = self.patches(x)
         x = self.patch_conv(x)
