@@ -17,15 +17,15 @@ from scipy.stats import linregress
 
 
 ##### globals #####
-path = r'//Users/trentstarkey/Desktop'
-inputs = '/Offsets_all'
+path = r'//Users/trentstarkey/Desktop/LinearRegressionData'
+inputs = '/Offsets_tinballs'
 outputs = '/Offsets_FFTs'
 test = '/Offsets_Test'
 boarder_crop = 3
 sigX = 28
 sigY = 28
 av_mean = 1e-05
-sample = 'All'
+sample = 'Tin Balls'
 reg = '/all_metadata_' + sample + '.csv'
 error_bins = [0, 10, 20, 30, 40, 50]
 os.makedirs(path + outputs, exist_ok=True)
@@ -273,7 +273,7 @@ mean_major_axis = offset0.groupby('Current')['Major Axis'].mean()
 data['Major Axis Focus Mean'] = data['Current'].map(mean_major_axis)
 data['Major Axis Delta'] = data['Major Axis Focus Mean'] - data['Major Axis']
 
-# data = data[data['Offset'] != 0]
+data = data[data['Offset'] != 0]
 
 fig, ax = plt.subplots(figsize=(8, 10))
 g = sns.relplot(data = data, x = 'Offset', y = 'Peak Width', col = 'Current', hue = 'File', palette = 'cool')
@@ -284,7 +284,7 @@ g.figure.subplots_adjust(top=0.84)
 g.figure.text(0.5, 0.015, 'Offset', ha = 'center', va = 'center')
 plt.suptitle('Prominent Peak Width by Offset \n Sample: ' + sample)
 plt.savefig(path + outputs + '/Peak_Intensity_Width_by_Offset_' + sample + '.png', bbox_inches = 'tight')
-
+'''
 ##### predict offset from peak width #####
 data = pd.read_csv(path + outputs + reg)
 data = data[data['Offset'] >= 0]
@@ -399,3 +399,4 @@ p.figure.subplots_adjust(top=0.84)
 p.figure.text(0.5, 0.015, 'Absolute Offset', ha = 'center', va = 'center')
 plt.suptitle('Predicted Offset vs Absolute Offset from Test Data \n Model: ' + sample)
 plt.savefig(path + outputs + '/test_results_test_' + sample + '.png', bbox_inches = 'tight')
+'''

@@ -10,11 +10,10 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
-from torch.utils.data import WeightedRandomSampler, ConcatDataset, Subset
+from torch.utils.data import ConcatDataset, Subset
 from torch.profiler import profile, ProfilerActivity
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
-import torchvision
 
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop'
@@ -25,17 +24,17 @@ csv_file_val = path + '/RegressionData_30kV_0.09nA_val/labels.csv'
 test_dir = path + '/RegressionData_30kV_0.09nA_test'
 csv_file_test = path + '/RegressionData_30kV_0.09nA_test/labels.csv'
 
-batch = 12
-learning_rate = 1e-2
-mod_name = '2.0'
-epochs = 10
+batch = 32
+learning_rate = 1e-3
+mod_name = '2.1'
+epochs = 12
+tolerance = 3.0
 
 USE_PROFILER = False
-TOLERANCE = 3.0
 
 ##### define functions #####
 class Data(Dataset):
-    def __init__(self, image_dir, csv_file, transform = None):
+    def __init__(self, image_dir, csv_file, transform=None):
         self.image_dir = image_dir
         self.transform = transform
 
@@ -59,12 +58,13 @@ class Data(Dataset):
         return image, label
 
 def create_datasets():
-    transform = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor()])
+    transform_train = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor()])
+    transform_val = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor()])
     generator = torch.Generator().manual_seed(1)
     
     #----- create datasets -----#
-    dataset = Data(image_dir = image_dir, csv_file = csv_file, transform = transform)
-    dataset1 = Data(image_dir = val_dir, csv_file = csv_file_val, transform = transform)
+    dataset = Data(image_dir=image_dir, csv_file=csv_file, transform=transform_train)
+    dataset1 = Data(image_dir=val_dir, csv_file=csv_file_val, transform=transform_val)
     indices = torch.randperm(len(dataset1), generator = generator).tolist()
     
     #----- create training and val split -----#
@@ -74,8 +74,8 @@ def create_datasets():
     train_dataset0, val_dataset0 = random_split(dataset, [train_size, val_size], generator = generator)
     
     #----- create secondary training and val split -----#
-    train_fraction1 = 0.1 
-    val_fraction1 = 0.4   
+    train_fraction1 = 0.2
+    val_fraction1 = 0.25
     
     train_size1 = int(train_fraction1 * len(dataset1))
     val_size1 = int(val_fraction1 * len(dataset1))
@@ -88,40 +88,45 @@ def create_datasets():
     val_dataset = ConcatDataset([val_dataset0, val_dataset1])
     train_dataset = ConcatDataset([train_dataset0, train_dataset1])
 
-    '''
-    #------ create random samplers to ensure even data representation ------#
-    train_labels0 = dataset.data.iloc[train_dataset0.indices]['Defocus']
-    train_counts0 = train_labels0.value_counts()
-    train_weights0 = train_labels0.map(lambda x: 1.0 / np.sqrt(train_counts0[x])).values
-
-    train_labels1 = dataset1.data.iloc[train_dataset1.indices]['Defocus']
-    train_counts1 = train_labels1.value_counts()
-    train_weights1 = train_labels1.map(lambda x: 1.0 / np.sqrt(train_counts1[x])).values
-    
-    train_weights = np.concatenate([train_weights0, train_weights1])
-    sampler_train = WeightedRandomSampler(weights = torch.DoubleTensor(train_weights), num_samples=len(train_dataset), replacement = True)
-
-    val_labels0 = dataset.data.iloc[val_dataset0.indices]['Defocus']
-    val_counts0 = val_labels0.value_counts()
-    val_weights0 = val_labels0.map(lambda x: 1.0 / np.sqrt(val_counts0[x])).values
-
-    val_labels1 = dataset1.data.iloc[val_dataset1.indices]['Defocus']
-    val_counts1 = val_labels1.value_counts()
-    val_weights1 = val_labels1.map(lambda x: 1.0 / np.sqrt(val_counts1[x])).values
-    
-    val_weights = np.concatenate([val_weights0 , val_weights1])
-    sampler_val = WeightedRandomSampler(weights = torch.DoubleTensor(val_weights), num_samples=len(val_dataset), replacement = False)
-    '''
-
     #----- create final dataloaders -----#
     train_loader = DataLoader(train_dataset, batch_size = batch)
     val_loader = DataLoader(val_dataset, batch_size = batch, shuffle = False)
 
     return train_loader, val_loader
 
+def get_normalization_stats(train_loader):
+    image_sum = 0.0
+    image_squared_sum = 0.0
+    image_count = 0
+
+    label_sum = 0.0
+    label_squared_sum = 0.0
+    label_count = 0
+
+    with torch.no_grad():
+        for images, labels in train_loader:
+            images = images.float()
+            labels = labels.float()
+
+            image_sum += images.sum().item()
+            image_squared_sum += (images ** 2).sum().item()
+            image_count += images.numel()
+
+            label_sum += labels.sum().item()
+            label_squared_sum += (labels ** 2).sum().item()
+            label_count += labels.numel()
+
+    image_mean = image_sum / image_count
+    image_std = np.sqrt(image_squared_sum / image_count - image_mean ** 2)
+    label_mean = label_sum / label_count
+    label_std = np.sqrt(label_squared_sum / label_count - label_mean ** 2)
+
+    return image_mean, image_std, label_mean, label_std
+
 class ExpReLU(nn.Module):
        def forward(self, x):
-            x = torch.clamp_min(x * torch.exp(torch.clamp(x, max = 10)), 0)
+            x = torch.clamp(x, max = 4) #5
+            x = torch.clamp_min(x * torch.exp(x), 0)
             return x 
 
 class ResizeResidual(nn.Module):
@@ -167,19 +172,17 @@ class Patches(nn.Module):
         return self.projection(x) 
 
 class Loss(nn.Module):
-    def __init__(self, l1_weight=1.0, mse_weight=0.1):
+    def __init__(self):
         super().__init__()
         self.l1 = nn.L1Loss()
-        self.mse = nn.MSELoss()
-        self.l1_weight = l1_weight
-        self.mse_weight = mse_weight
 
     def forward(self, predictions, targets):
-        l1_loss = self.l1(predictions, targets)
-        mse_loss = self.mse(predictions, targets)
+        error = torch.abs(targets - predictions)
+        var = torch.var(predictions)
+        l1_loss = self.l1(predictions * torch.exp(error * var), targets)
 
-        return self.l1_weight * l1_loss + self.mse_weight * mse_loss
-
+        return l1_loss 
+    
 class DefocusRegressionCNN(nn.Module):
     def __init__(self):
         super().__init__()
@@ -207,14 +210,6 @@ class DefocusRegressionCNN(nn.Module):
 
         self.res3 = nn.Conv2d(64,8, kernel_size = 3)
 
-        self.transpose = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
-        self.transpose_pool = nn.MaxPool2d(2)
-        self.upsample = nn.Upsample(scale_factor = 2, mode = 'bilinear', align_corners = False)
-        self.bn5 = nn.BatchNorm2d(36)
-
-        self.res_up = nn.Upsample(scale_factor = 2, mode = 'bilinear', align_corners = False)
-        self.transpose_res = nn.ConvTranspose2d(8, 36, kernel_size = 3, padding = 0)
-
         self.patches = Patches(in_channels = 8, patch_size = 4, embed_dim = 128)
         self.patch_conv = nn.Conv2d(in_channels = 128, out_channels = 64, kernel_size = 1)
 
@@ -237,6 +232,7 @@ class DefocusRegressionCNN(nn.Module):
         x = self.pad1(x)
         x = self.conv1(x)
         x = self.act(x)
+        # print((x == 0).float().mean().item())
         x = F.max_pool2d(x,2)
         x = self.bn1(x)
 
@@ -278,18 +274,6 @@ class DefocusRegressionCNN(nn.Module):
         x = x + res
         activation = x
 
-        # x = self.transpose(x)
-        # x = self.act(x)
-        # x = self.transpose_pool(x)
-        # x = self.bn5(x)
-        # x = self.upsample(x)
-
-        # res = self.res_up(activation)
-        # res = self.transpose_res(res)
-        # res = F.interpolate(res, size = x.shape[2:], mode = 'bilinear', align_corners = False)
-
-        # x = x + res
-
         x = self.patches(x)
         x = self.patch_conv(x)
         x = F.relu(x)
@@ -320,13 +304,19 @@ class DefocusRegressionCNN(nn.Module):
         return x
 
 class Trainer:
-    def __init__(self, model, train_loader, val_loader, device, learning_rate = learning_rate):
+    def __init__(self, model, train_loader, val_loader, device, 
+                 image_std, image_mean, label_std, label_mean, learning_rate = learning_rate):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device    
-        self.loss_fn = nn.L1Loss()
-        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr = learning_rate, lr_decay = 1e-6)
+        self.image_std = image_std
+        self.image_mean = image_mean
+        self.label_std = label_std
+        self.label_mean = label_mean
+        self.loss_fn = Loss()
+        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr=learning_rate) 
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=1e-5, patience=3)
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir)
@@ -340,12 +330,11 @@ class Trainer:
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
-        max_steps = 300
         total_correct = 0
         total_samples = 0
         total_batches = 0
 
-        progress = tqdm(enumerate(self.train_loader), total = max_steps, desc=f'Epoch {epoch+1}/{epochs}')
+        progress = tqdm(enumerate(self.train_loader), total = len(self.train_loader), desc=f'Training {epoch+1}/{epochs}')
 
         if USE_PROFILER == True:
             with profile(activities=[ProfilerActivity.CPU], schedule = torch.profiler.schedule(
@@ -354,22 +343,25 @@ class Trainer:
                         record_shapes = True, profile_memory = True, with_stack = True) as prof:
 
                 for batch_idx, (images, labels) in progress:
-                    if batch_idx >= max_steps:
-                        break
-
                     self.optimizer.zero_grad()
 
                     images = images.to(self.device)
                     labels = labels.to(self.device).unsqueeze(1).float()
+                    images = (images - self.image_mean) / self.image_std
+                    labels = (labels - self.label_mean) / self.label_std
                     # print(labels)
                     predictions = self.model(images)
                     # print(predictions)
                     loss = self.loss_fn(predictions, labels)
 
                     loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
 
-                    total_correct += (torch.abs(predictions - labels) <= TOLERANCE).sum().item()
+                    predictions_raw = predictions * self.label_std + self.label_mean
+                    labels_raw = labels * self.label_std + self.label_mean
+
+                    total_correct += (torch.abs(predictions_raw - labels_raw) <= tolerance).sum().item()
                     total_samples += labels.size(0)
                     total_loss += loss.item()
                     total_batches += 1
@@ -379,22 +371,25 @@ class Trainer:
 
         else:
             for batch_idx, (images, labels) in progress:
-                if batch_idx >= max_steps:
-                    break
-
                 self.optimizer.zero_grad()
 
                 images = images.to(self.device)
                 labels = labels.to(self.device).unsqueeze(1).float()
+                images = (images - self.image_mean) / self.image_std
+                labels = (labels - self.label_mean) / self.label_std
                 # print(labels)
                 predictions = self.model(images)
                 # print(predictions)
                 loss = self.loss_fn(predictions, labels)
 
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
-                total_correct += (torch.abs(predictions - labels) <= TOLERANCE).sum().item()
+                predictions_raw = predictions * self.label_std + self.label_mean
+                labels_raw = labels * self.label_std + self.label_mean
+
+                total_correct += (torch.abs(predictions_raw - labels_raw) <= tolerance).sum().item()
                 total_samples += labels.size(0)
                 total_loss += loss.item()
                 total_batches += 1
@@ -408,7 +403,7 @@ class Trainer:
         total_samples = 0
         total_batches = 0
 
-        progress = tqdm(enumerate(self.val_loader), desc = 'Validation') 
+        progress = tqdm(enumerate(self.val_loader), total = len(self.val_loader), desc = 'Validation') 
 
         if USE_PROFILER == True:
             with torch.no_grad():
@@ -416,6 +411,9 @@ class Trainer:
                     images = images.to(self.device)
                     labels = labels.to(self.device).float()
                     labels = labels.unsqueeze(1)
+                    images = (images - self.image_mean) / self.image_std
+                    labels = (labels - self.label_mean) / self.label_std
+
                     # print(labels)
                     predictions = self.model(images)
                     # print(predictions)
@@ -427,7 +425,10 @@ class Trainer:
                     loss = self.loss_fn(predictions, labels)
                     total_loss += loss.item()
 
-                    total_correct += (torch.abs(predictions - labels) <= TOLERANCE).sum().item()
+                    predictions_raw = predictions * self.label_std + self.label_mean
+                    labels_raw = labels * self.label_std + self.label_mean
+
+                    total_correct += (torch.abs(predictions_raw - labels_raw) <= tolerance).sum().item()
                     total_samples += labels.size(0)
                     total_batches += 1
 
@@ -436,12 +437,11 @@ class Trainer:
         else:
             with torch.no_grad():
                 for batch_idx, (images, labels) in progress:
-                    # if batch_idx >= max_steps:
-                    #     break
-
                     images = images.to(self.device)
                     labels = labels.to(self.device).float()
                     labels = labels.unsqueeze(1)
+                    images = (images - self.image_mean) / self.image_std
+                    labels = (labels - self.label_mean) / self.label_std
                     # print(labels)
                     predictions = self.model(images)
                     # print(predictions)
@@ -449,7 +449,12 @@ class Trainer:
                     loss = self.loss_fn(predictions, labels)
                     total_loss += loss.item()
 
-                    total_correct += (torch.abs(predictions - labels) <= TOLERANCE).sum().item()
+                    predictions_raw = predictions * self.label_std + self.label_mean
+                    labels_raw = labels * self.label_std + self.label_mean
+
+                    # print(predictions_raw,labels_raw)
+
+                    total_correct += (torch.abs(predictions_raw - labels_raw) <= tolerance).sum().item()
                     total_samples += labels.size(0)
                     total_batches += 1
 
@@ -462,13 +467,16 @@ class Trainer:
             for epoch in range(epochs):
                 train_loss, train_accuracy = self.train_epoch(epoch)
                 val_loss, val_accuracy = self.validate(epoch)
+                # self.scheduler.step(val_loss)
 
                 print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}',
                     f'Train Loss: {train_loss:.6f}', f'Val Accuracy: {val_accuracy}', f'Val Loss: {val_loss:.6f}')
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    torch.save(self.model.state_dict(), save_path)
+                    torch.save({'model_state_dict': self.model.state_dict(),
+                                    'image_mean': self.image_mean, 'image_std': self.image_std,
+                                    'label_mean': self.label_mean, 'label_std': self.label_std}, save_path)
 
                 self.writer.add_scalar('Loss/train', train_loss, epoch)
                 self.writer.add_scalar('Loss/validation', val_loss, epoch)
@@ -487,68 +495,84 @@ class Trainer:
              for epoch in range(epochs):
                 train_loss, train_accuracy = self.train_epoch(epoch)
                 val_loss, val_accuracy = self.validate(epoch)
+                self.scheduler.step(val_loss)
 
                 print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}',
                     f'Train Loss: {train_loss:.6f}', f'Val Accuracy: {val_accuracy}', f'Val Loss: {val_loss:.6f}')
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    torch.save(self.model.state_dict(), save_path)
+                    torch.save({'model_state_dict': self.model.state_dict(),
+                                    'image_mean': self.image_mean, 'image_std': self.image_std,
+                                    'label_mean': self.label_mean, 'label_std': self.label_std}, save_path)
 
         return 
 
-def predict_image(model, image_path, device):
-    transform = transforms.Compose([transforms.Resize((256, 256)), transforms.ToTensor()])
+def predict_image(model, image_path, device, image_mean, image_std, label_mean,label_std):
+    transform = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor()])
     image = Image.open(image_path).convert('L')
     image = transform(image).unsqueeze(0).to(device)
+    image = (image - image_mean) / image_std
 
     model.eval()
 
     with torch.no_grad():
         prediction = model(image)
 
+    prediction = prediction * label_std + label_mean
+
     return prediction.item()
 
 ##### train and validate model #####
 if __name__ == "__main__":
+
     torch.mps.empty_cache()
     train_loader, val_loader = create_datasets()
+    image_mean, image_std, label_mean, label_std = get_normalization_stats(train_loader)
     device = ('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     model = DefocusRegressionCNN().to(device)
 
     trainer = Trainer(model=model, train_loader = train_loader, val_loader = val_loader,
-        device=device, learning_rate = learning_rate)
+        device=device, image_mean = image_mean, image_std = image_std, 
+        label_mean = label_mean, label_std = label_std,  learning_rate = learning_rate)
     trainer.fit(epochs = epochs, save_path=f'RegressionMod_{mod_name}.pt')
 
-##### test model #####
-device = ('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-model = DefocusRegressionCNN().to(device)
-model.load_state_dict(torch.load('RegressionMod_2.0.pt', map_location=device))
-labels = pd.read_csv(csv_file_test)
-accuracy_defocus_stig = 0
-accuracy_defocus_only = 0
+    ##### test model #####
+    device = ('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    model = DefocusRegressionCNN().to(device)
+    checkpoint = torch.load('RegressionMod_2.1.pt', map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
 
-progress = tqdm(labels.iterrows(), total=len(labels), desc='Test')
+    image_mean = checkpoint['image_mean']
+    image_std = checkpoint['image_std']
+    label_mean = checkpoint['label_mean']
+    label_std = checkpoint['label_std']
 
-for _, row in progress:
-    image = str(int(row['Image']))
-    image_path = test_dir + '/' + image + '.jpeg'
-    label = row['Defocus']
-    lx = row['StigX']
-    ly = row['StigY']
+    labels = pd.read_csv(csv_file_test)
+    accuracy_defocus_stig = 0
+    accuracy_defocus_only = 0
 
-    prediction = predict_image(model, image_path, device)
+    progress = tqdm(labels.iterrows(), total=len(labels), desc='Test')
 
-    if abs(prediction - label) <= TOLERANCE:
-        accuracy_defocus_stig += 1
+    for _, row in progress:
+        image = str(int(row['Image']))
+        image_path = test_dir + '/' + image + '.jpeg'
+        label = row['Defocus']
+        lx = row['StigX']
+        ly = row['StigY']
 
-        if lx == 0 and ly == 0:
-            accuracy_defocus_only += 1
+        prediction = predict_image(model, image_path, device, image_mean, image_std, label_mean, label_std)
 
-progress.close()
+        if abs(prediction - label) <= tolerance:
+            accuracy_defocus_stig += 1
 
-total_accuracy_defocus_stig = accuracy_defocus_stig / len(labels)
-total_accuracy_defocus = accuracy_defocus_only / (((labels['StigX'] == 0) & (labels['StigY'] == 0)).sum())
+            if lx == 0 and ly == 0:
+                accuracy_defocus_only += 1
 
-print(f'Accuracy for all images: {total_accuracy_defocus_stig}')
-print(f'Accuracy for defocused images: {total_accuracy_defocus}')
+    progress.close()
+
+    total_accuracy_defocus_stig = accuracy_defocus_stig / len(labels)
+    total_accuracy_defocus = accuracy_defocus_only / (((labels['StigX'] == 0) & (labels['StigY'] == 0)).sum())
+
+    print(f'Accuracy for all images: {total_accuracy_defocus_stig}')
+    print(f'Accuracy for defocused images: {total_accuracy_defocus}')
