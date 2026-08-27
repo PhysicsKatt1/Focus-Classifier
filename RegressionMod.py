@@ -26,7 +26,7 @@ csv_file_test = path + '/RegressionData_30kV_0.09nA_test/labels.csv'
 
 batch = 32
 learning_rate = 1e-3
-mod_name = '2.1'
+mod_name = '2.2'
 epochs = 12
 tolerance = 3.0
 
@@ -125,7 +125,7 @@ def get_normalization_stats(train_loader):
 
 class ExpReLU(nn.Module):
        def forward(self, x):
-            x = torch.clamp(x, max = 4) #5
+            x = torch.clamp(x, max = 5) 
             x = torch.clamp_min(x * torch.exp(x), 0)
             return x 
 
@@ -315,8 +315,8 @@ class Trainer:
         self.label_std = label_std
         self.label_mean = label_mean
         self.loss_fn = Loss()
-        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr=learning_rate) 
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=1e-5, patience=3)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate) 
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=1e-4, patience=3)
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir)
@@ -540,7 +540,7 @@ if __name__ == "__main__":
     ##### test model #####
     device = ('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     model = DefocusRegressionCNN().to(device)
-    checkpoint = torch.load('RegressionMod_2.1.pt', map_location=device, weights_only=False)
+    checkpoint = torch.load('RegressionMod_2.2.pt', map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
 
     image_mean = checkpoint['image_mean']
