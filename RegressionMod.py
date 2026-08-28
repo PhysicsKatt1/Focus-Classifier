@@ -315,8 +315,7 @@ class Trainer:
         self.label_std = label_std
         self.label_mean = label_mean
         self.loss_fn = Loss()
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate) 
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=1e-4, patience=3)
+        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr=learning_rate) 
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir)
@@ -467,7 +466,6 @@ class Trainer:
             for epoch in range(epochs):
                 train_loss, train_accuracy = self.train_epoch(epoch)
                 val_loss, val_accuracy = self.validate(epoch)
-                # self.scheduler.step(val_loss)
 
                 print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}',
                     f'Train Loss: {train_loss:.6f}', f'Val Accuracy: {val_accuracy}', f'Val Loss: {val_loss:.6f}')
@@ -495,7 +493,6 @@ class Trainer:
              for epoch in range(epochs):
                 train_loss, train_accuracy = self.train_epoch(epoch)
                 val_loss, val_accuracy = self.validate(epoch)
-                self.scheduler.step(val_loss)
 
                 print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}',
                     f'Train Loss: {train_loss:.6f}', f'Val Accuracy: {val_accuracy}', f'Val Loss: {val_loss:.6f}')
