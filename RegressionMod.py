@@ -284,7 +284,7 @@ class DefocusRegressionCNN(nn.Module):
         x = x + res
         activation = x
 
-        x = self.dropout(x)
+        # x = self.dropout(x)
         x = self.fft(x)
         x = self.fft_conv(x)
         x = F.relu(x)
