@@ -14,8 +14,8 @@ warnings.filterwarnings("ignore")
 
 # ##### globals #####
 path = r'/Users/trentstarkey/Desktop' 
-train_and_val_inputs = r'/Volumes/ThruFocusData/ThruFocusData/30kV90pA/TestData/Showerdrains_1535HFW/SortedJpegs'
-train_and_val_outputs = r'/RegressionData_30kV_0.09nA_test_showerDrains'
+train_and_val_inputs = r'/Volumes/ThruFocusData/ThruFocusData/MixedBeams/TrainingData/MIxed_TrainingData_Raw'
+train_and_val_outputs = r'/RegressionData_30kV_0.09nA'
 
 os.makedirs(path + train_and_val_outputs, exist_ok=True)
 
@@ -49,14 +49,15 @@ for subfolders in os.listdir(train_and_val_inputs):
 
         try:
             # hfw, volt, amp = parse_tiff(im)
-            name = images.removeprefix('Focus_data_30000.0V_0.09nA__')
-            defocus, stigx, stigy, _, _ = name.split('__')
+            if 'Focus_data_30000.0V_0.09nA__' in images:
+                name = images.removeprefix('Focus_data_30000.0V_0.09nA__')
+                defocus, stigx, stigy, _, _ = name.split('__')
 
-            # if float(stigx) == 0.0 and float(stigy) == 0.0:
-            im_count += 1
-            
-            im.save(path + train_and_val_outputs + '/' + str(im_count) + '.jpeg', format = 'JPEG')
-            labels.append({'Image': str(im_count), 'Voltage': 30000.0, 'Current': 0.09, 'Defocus': defocus, 'StigX': stigx, 'StigY': stigy})
+                if float(stigx) == 0.0 and float(stigy) == 0.0 and float(defocus) == 0:
+                    im_count += 1
+                    
+                    im.save(path + train_and_val_outputs + '/' + str(im_count) + '.jpeg', format = 'JPEG')
+                    labels.append({'Image': str(im_count), 'Voltage': 30000.0, 'Current': 0.09, 'Defocus': defocus, 'StigX': stigx, 'StigY': stigy})
         
         except:
             continue

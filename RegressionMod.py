@@ -14,6 +14,7 @@ from torch.utils.data import ConcatDataset, Subset
 from torch.profiler import profile, ProfilerActivity
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+import torchvision
 
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop'
@@ -26,7 +27,7 @@ csv_file_test = path + '/RegressionData_30kV_0.09nA_test/labels.csv'
 
 batch = 32
 learning_rate = 1e-3
-mod_name = '2.2'
+mod_name = '2.3'
 epochs = 12
 tolerance = 3.0
 
@@ -143,20 +144,20 @@ class ResizeResidual(nn.Module):
 class FFT(nn.Module):
     def forward(self, x):
         # x  = x[:, :, 3:-3, 3:-3]
-        # blur = torchvision.transforms.GaussianBlur(kernel_size = (1, 1), sigma = (28, 28))
-        # background = blur(x)
-        # x = (x - background)
+        blur = torchvision.transforms.GaussianBlur(kernel_size = (1, 1), sigma = (28, 28))
+        background = blur(x)
+        x = (x - background)
         # x = x / torch.max(x)
 
-        # x = torch.fft.fft2(x, norm = 'ortho')
-        # x = torch.fft.fftshift(x)
-        # x = torch.log1p(torch.abs(x))
+        x = torch.fft.fft2(x, norm = 'ortho')
+        x = torch.fft.fftshift(x)
+        x = torch.log1p(torch.abs(x))
         # x = x - (torch.mean(x, dim=(-2, -1), keepdim=True) - 1e-05)
 
         # h, w = x.shape[-2:]
         # hc, wc = h//2, w//2 
         # x = x[:, :, hc - 128: hc + 128, wc - 128: wc + 128] 
-        return torch.fft.fftshift(x)
+        return x
     
 class IFFTShift(nn.Module):
     def forward(self, x):
@@ -387,6 +388,8 @@ class Trainer:
 
                 predictions_raw = predictions * self.label_std + self.label_mean
                 labels_raw = labels * self.label_std + self.label_mean
+                print(predictions_raw)
+                print( labels_raw)
 
                 total_correct += (torch.abs(predictions_raw - labels_raw) <= tolerance).sum().item()
                 total_samples += labels.size(0)
@@ -413,9 +416,9 @@ class Trainer:
                     images = (images - self.image_mean) / self.image_std
                     labels = (labels - self.label_mean) / self.label_std
 
-                    # print(labels)
                     predictions = self.model(images)
                     # print(predictions)
+                    # print(labels)
 
                     if batch_idx == 0:
                         self.writer.add_histogram('Predictions', predictions.detach().cpu(), epoch)
@@ -441,16 +444,15 @@ class Trainer:
                     labels = labels.unsqueeze(1)
                     images = (images - self.image_mean) / self.image_std
                     labels = (labels - self.label_mean) / self.label_std
-                    # print(labels)
                     predictions = self.model(images)
                     # print(predictions)
+                    # print(labels)
 
                     loss = self.loss_fn(predictions, labels)
                     total_loss += loss.item()
 
                     predictions_raw = predictions * self.label_std + self.label_mean
                     labels_raw = labels * self.label_std + self.label_mean
-
                     # print(predictions_raw,labels_raw)
 
                     total_correct += (torch.abs(predictions_raw - labels_raw) <= tolerance).sum().item()
@@ -537,7 +539,7 @@ if __name__ == "__main__":
     ##### test model #####
     device = ('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     model = DefocusRegressionCNN().to(device)
-    checkpoint = torch.load('RegressionMod_2.2.pt', map_location=device, weights_only=False)
+    checkpoint = torch.load('RegressionMod_2.3.pt', map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
 
     image_mean = checkpoint['image_mean']
@@ -548,6 +550,8 @@ if __name__ == "__main__":
     labels = pd.read_csv(csv_file_test)
     accuracy_defocus_stig = 0
     accuracy_defocus_only = 0
+    accuracy_focused = 0
+    accuracy_defocused = 0
 
     progress = tqdm(labels.iterrows(), total=len(labels), desc='Test')
 
@@ -566,10 +570,22 @@ if __name__ == "__main__":
             if lx == 0 and ly == 0:
                 accuracy_defocus_only += 1
 
+                if label == 0:
+                    accuracy_focused += 1
+                else:
+                    accuracy_defocused += 1
+
     progress.close()
 
     total_accuracy_defocus_stig = accuracy_defocus_stig / len(labels)
-    total_accuracy_defocus = accuracy_defocus_only / (((labels['StigX'] == 0) & (labels['StigY'] == 0)).sum())
-
+    total_accuracy_defocus_only = accuracy_defocus_only / (((labels['StigX'] == 0) & (labels['StigY'] == 0)).sum())
+    total_accuracy_focused = accuracy_focused /(((labels['StigX'] == 0) & (labels['StigY'] == 0) & 
+                                                 (labels['Defocus'] == 0)).sum())
+    total_accuracy_defocus_only_defocused = accuracy_defocused /(((labels['StigX'] == 0) & 
+                                                (labels['StigY'] == 0) & (labels['Defocus'] != 0)).sum())
+    
     print(f'Accuracy for all images: {total_accuracy_defocus_stig}')
-    print(f'Accuracy for defocused images: {total_accuracy_defocus}')
+    print(f'Accuracy for defocused images: {total_accuracy_defocus_only}')
+    print(f'Accuracy for focused images: {total_accuracy_focused}')
+    print(f'Accuracy for defocused images no stig: {total_accuracy_defocus_only_defocused}')
+    
