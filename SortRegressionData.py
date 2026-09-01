@@ -14,8 +14,8 @@ warnings.filterwarnings("ignore")
 
 # ##### globals #####
 path = r'/Users/trentstarkey/Desktop' 
-train_and_val_inputs = r'/Volumes/ThruFocusData/ThruFocusData/MixedBeams/TrainingData/MIxed_TrainingData_Raw'
-train_and_val_outputs = r'/RegressionData_30kV_0.09nA'
+train_and_val_inputs = r'/Volumes/ThruFocusData/ThruFocusData/MixedBeams/ValData/30kV_ValData_Raw'
+train_and_val_outputs = r'/RegressionData_30kV_0.09nA_val'
 
 os.makedirs(path + train_and_val_outputs, exist_ok=True)
 
@@ -37,23 +37,24 @@ def parse_tiff(image):
 
 ##### call functions #####
 labels = []
-im_count = 0
+im_count = 2863
 for subfolders in os.listdir(train_and_val_inputs):
     if '.DS_Store' in subfolders:
         continue
 
     for images, n in zip(os.listdir(train_and_val_inputs + '/' + subfolders),
                              tqdm(range(len(os.listdir(train_and_val_inputs + '/' + subfolders))))):
-        im = Image.open(train_and_val_inputs + '/' + subfolders + '/' + images)
-        images = images[:-4]
 
         try:
+            im = Image.open(train_and_val_inputs + '/' + subfolders + '/' + images)
+            images = images[:-4]
+
             # hfw, volt, amp = parse_tiff(im)
             if 'Focus_data_30000.0V_0.09nA__' in images:
                 name = images.removeprefix('Focus_data_30000.0V_0.09nA__')
                 defocus, stigx, stigy, _, _ = name.split('__')
 
-                if float(stigx) == 0.0 and float(stigy) == 0.0 and float(defocus) == 0:
+                if float(stigx) == 0.0 and float(stigy) == 0.0 and float(defocus) != 0:
                     im_count += 1
                     
                     im.save(path + train_and_val_outputs + '/' + str(im_count) + '.jpeg', format = 'JPEG')
@@ -61,5 +62,10 @@ for subfolders in os.listdir(train_and_val_inputs):
         
         except:
             continue
+
 all_labels = pd.DataFrame(labels)
-all_labels.to_csv(path + train_and_val_outputs + '/labels.csv')
+# all_labels.to_csv(path + train_and_val_outputs + '/labels.csv')
+
+csv = pd.read_csv(path + train_and_val_outputs + '/labels.csv')
+all_dat = pd.concat([csv, all_labels], ignore_index=True)
+all_dat.to_csv(path + train_and_val_outputs + '/labels.csv')

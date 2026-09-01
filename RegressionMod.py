@@ -27,11 +27,11 @@ csv_file_test = path + '/RegressionData_30kV_0.09nA_test/labels.csv'
 
 batch = 32
 learning_rate = 1e-3
-mod_name = '2.3'
-epochs = 12
+mod_name = '1.0'
+epochs = 5
 tolerance = 3.0
 
-USE_PROFILER = False
+USE_PROFILER = True
 
 ##### define functions #####
 class Data(Dataset):
@@ -75,7 +75,7 @@ def create_datasets():
     train_dataset0, val_dataset0 = random_split(dataset, [train_size, val_size], generator = generator)
     
     #----- create secondary training and val split -----#
-    train_fraction1 = 0.2
+    train_fraction1 = 0.25
     val_fraction1 = 0.25
     
     train_size1 = int(train_fraction1 * len(dataset1))
@@ -90,8 +90,9 @@ def create_datasets():
     train_dataset = ConcatDataset([train_dataset0, train_dataset1])
 
     #----- create final dataloaders -----#
-    train_loader = DataLoader(train_dataset, batch_size = batch)
-    val_loader = DataLoader(val_dataset, batch_size = batch, shuffle = False)
+    train_loader = DataLoader(train_dataset, batch_size = batch, num_workers = 4, persistent_workers = True)
+    val_loader = DataLoader(val_dataset, batch_size = batch, shuffle = False, num_workers = 4, 
+                            persistent_workers = True)
 
     return train_loader, val_loader
 
@@ -143,21 +144,17 @@ class ResizeResidual(nn.Module):
 
 class FFT(nn.Module):
     def forward(self, x):
-        # x  = x[:, :, 3:-3, 3:-3]
-        blur = torchvision.transforms.GaussianBlur(kernel_size = (1, 1), sigma = (28, 28))
-        background = blur(x)
-        x = (x - background)
-        # x = x / torch.max(x)
+        # blur = torchvision.transforms.GaussianBlur(kernel_size = (3, 3), sigma = (28, 28))
+        # background = blur(x)
+        # x = (x - background)
 
-        x = torch.fft.fft2(x, norm = 'ortho')
-        x = torch.fft.fftshift(x)
-        x = torch.log1p(torch.abs(x))
-        # x = x - (torch.mean(x, dim=(-2, -1), keepdim=True) - 1e-05)
+        # x = torch.fft.fft2(x, norm = 'ortho')
+        # x = torch.fft.fftshift(x)
+        # x = torch.log1p(torch.abs(x))
 
-        # h, w = x.shape[-2:]
-        # hc, wc = h//2, w//2 
-        # x = x[:, :, hc - 128: hc + 128, wc - 128: wc + 128] 
-        return x
+        # x = x - x.mean(dim=(-2, -1), keepdim=True)
+
+        return torch.fft.fftshift(x)
     
 class IFFTShift(nn.Module):
     def forward(self, x):
@@ -285,7 +282,7 @@ class DefocusRegressionCNN(nn.Module):
         x = x + res
         activation = x
 
-        # x = self.dropout(x)
+        x = self.dropout(x)
         x = self.fft(x)
         x = self.fft_conv(x)
         x = F.relu(x)
@@ -315,7 +312,7 @@ class Trainer:
         self.image_mean = image_mean
         self.label_std = label_std
         self.label_mean = label_mean
-        self.loss_fn = Loss()
+        self.loss_fn = nn.L1Loss()
         self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr=learning_rate) 
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -388,8 +385,8 @@ class Trainer:
 
                 predictions_raw = predictions * self.label_std + self.label_mean
                 labels_raw = labels * self.label_std + self.label_mean
-                print(predictions_raw)
-                print( labels_raw)
+                # print(predictions_raw)
+                # print( labels_raw)
 
                 total_correct += (torch.abs(predictions_raw - labels_raw) <= tolerance).sum().item()
                 total_samples += labels.size(0)
@@ -507,20 +504,49 @@ class Trainer:
 
         return 
 
-def predict_image(model, image_path, device, image_mean, image_std, label_mean,label_std):
-    transform = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor()])
-    image = Image.open(image_path).convert('L')
-    image = transform(image).unsqueeze(0).to(device)
-    image = (image - image_mean) / image_std
+class TestData(Dataset):
+    def __init__(self, test_dir, csv_file, transform=None):
+        self.test_dir = test_dir
+        self.data = pd.read_csv(csv_file)
+        self.transform = transform
 
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        image_name = str(int(row['Image']))
+        image_path = os.path.join(self.test_dir, image_name + '.jpeg')
+        image = Image.open(image_path).convert('L')
+
+        if self.transform:
+            image = self.transform(image)
+
+        label = torch.tensor(row['Defocus'],dtype=torch.float32)
+
+        return image, label
+
+def predict_image(model, test_loader, device, image_mean, image_std, label_mean,label_std):
     model.eval()
+    correct = 0
+    samples = 0
+
+    progress = tqdm(test_loader, desc='Test')
 
     with torch.no_grad():
-        prediction = model(image)
+        for images, labels in progress:
+            images = images.to(device)
+            labels = labels.to(device).unsqueeze(1).float()
 
-    prediction = prediction * label_std + label_mean
+            images_norm = (images - image_mean) / image_std
+            predictions = model(images_norm)
+            predictions_raw = predictions * label_std + label_mean
 
-    return prediction.item()
+            hit = torch.abs(predictions_raw - labels) <= tolerance
+            correct += hit.sum().item()
+            samples += labels.size(0)
+
+    return correct / samples
 
 ##### train and validate model #####
 if __name__ == "__main__":
@@ -539,7 +565,7 @@ if __name__ == "__main__":
     ##### test model #####
     device = ('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     model = DefocusRegressionCNN().to(device)
-    checkpoint = torch.load('RegressionMod_2.3.pt', map_location=device, weights_only=False)
+    checkpoint = torch.load('RegressionMod_1.0.pt', map_location = device, weights_only = False)
     model.load_state_dict(checkpoint['model_state_dict'])
 
     image_mean = checkpoint['image_mean']
@@ -547,45 +573,11 @@ if __name__ == "__main__":
     label_mean = checkpoint['label_mean']
     label_std = checkpoint['label_std']
 
-    labels = pd.read_csv(csv_file_test)
-    accuracy_defocus_stig = 0
-    accuracy_defocus_only = 0
-    accuracy_focused = 0
-    accuracy_defocused = 0
+    transform_test = transforms.Compose([transforms.Resize((256, 256)), transforms.ToTensor()])
+    test_dataset = TestData(test_dir = test_dir, csv_file = csv_file_test, transform = transform_test)
+    test_loader = DataLoader(test_dataset, batch_size = batch, shuffle = False)
 
-    progress = tqdm(labels.iterrows(), total=len(labels), desc='Test')
+    total_accuracy = predict_image(model, test_loader, device, image_mean, image_std, label_mean, label_std)
+    print(f'Total accuracy: {total_accuracy}')
 
-    for _, row in progress:
-        image = str(int(row['Image']))
-        image_path = test_dir + '/' + image + '.jpeg'
-        label = row['Defocus']
-        lx = row['StigX']
-        ly = row['StigY']
-
-        prediction = predict_image(model, image_path, device, image_mean, image_std, label_mean, label_std)
-
-        if abs(prediction - label) <= tolerance:
-            accuracy_defocus_stig += 1
-
-            if lx == 0 and ly == 0:
-                accuracy_defocus_only += 1
-
-                if label == 0:
-                    accuracy_focused += 1
-                else:
-                    accuracy_defocused += 1
-
-    progress.close()
-
-    total_accuracy_defocus_stig = accuracy_defocus_stig / len(labels)
-    total_accuracy_defocus_only = accuracy_defocus_only / (((labels['StigX'] == 0) & (labels['StigY'] == 0)).sum())
-    total_accuracy_focused = accuracy_focused /(((labels['StigX'] == 0) & (labels['StigY'] == 0) & 
-                                                 (labels['Defocus'] == 0)).sum())
-    total_accuracy_defocus_only_defocused = accuracy_defocused /(((labels['StigX'] == 0) & 
-                                                (labels['StigY'] == 0) & (labels['Defocus'] != 0)).sum())
-    
-    print(f'Accuracy for all images: {total_accuracy_defocus_stig}')
-    print(f'Accuracy for defocused images: {total_accuracy_defocus_only}')
-    print(f'Accuracy for focused images: {total_accuracy_focused}')
-    print(f'Accuracy for defocused images no stig: {total_accuracy_defocus_only_defocused}')
     
