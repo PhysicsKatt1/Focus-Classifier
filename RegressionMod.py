@@ -28,10 +28,10 @@ csv_file_test = path + '/RegressionData_30kV_0.09nA_test/labels.csv'
 batch = 32
 learning_rate = 1e-3
 mod_name = '1.0'
-epochs = 5
+epochs = 100
 tolerance = 3.0
 
-USE_PROFILER = True
+USE_PROFILER = False
 
 ##### define functions #####
 class Data(Dataset):
@@ -57,10 +57,15 @@ class Data(Dataset):
         label = torch.tensor(row['Defocus'], dtype=torch.float32)
 
         return image, label
+    
+def crop_edges(x):
+    return x[:, 3:-3, 3:-3]
 
 def create_datasets():
-    transform_train = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor()])
-    transform_val = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor()])
+    transform_train = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor(), 
+                                          transforms.Lambda(crop_edges)]) #transforms.RandomHorizontalFlip(p = 0.5), transforms.RandomRotation(33)
+    transform_val = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor(),
+                                        transforms.Lambda(crop_edges)])
     generator = torch.Generator().manual_seed(1)
     
     #----- create datasets -----#
@@ -75,7 +80,7 @@ def create_datasets():
     train_dataset0, val_dataset0 = random_split(dataset, [train_size, val_size], generator = generator)
     
     #----- create secondary training and val split -----#
-    train_fraction1 = 0.25
+    train_fraction1 = 0.2
     val_fraction1 = 0.25
     
     train_size1 = int(train_fraction1 * len(dataset1))
@@ -144,27 +149,31 @@ class ResizeResidual(nn.Module):
 
 class FFT(nn.Module):
     def forward(self, x):
-        # blur = torchvision.transforms.GaussianBlur(kernel_size = (3, 3), sigma = (28, 28))
-        # background = blur(x)
-        # x = (x - background)
+        blur = transforms.GaussianBlur(kernel_size = (3, 3), sigma = (28, 28))
+        background = blur(x)
+        x = (x - background)
+        # max_val = x.amax(dim = (-3, -2, -1), keepdim = True)
+        # x = x / max_val    
 
-        # x = torch.fft.fft2(x, norm = 'ortho')
-        # x = torch.fft.fftshift(x)
-        # x = torch.log1p(torch.abs(x))
+        x = torch.fft.fft2(x, norm = 'ortho')
+        x = torch.fft.fftshift(x)
+        x = torch.log1p(torch.abs(x))
 
-        # x = x - x.mean(dim=(-2, -1), keepdim=True)
+        x = x - x.mean(dim=(-2, -1), keepdim=True)
+        # fft_transform = transforms.CenterCrop(50)
+        # x = fft_transform(x)
 
-        return torch.fft.fftshift(x)
-    
+        return x
+
 class IFFTShift(nn.Module):
     def forward(self, x):
         return torch.fft.ifftshift(x)
 
 class Patches(nn.Module):
-    def __init__(self, in_channels, patch_size, embed_dim ):
+    def __init__(self, in_channels, patch_size, embed_dim):
         super().__init__()
         self.projection = nn.Conv2d(in_channels = in_channels, out_channels = embed_dim, 
-                                    kernel_size=patch_size, stride = patch_size)
+                                    kernel_size = patch_size, stride = patch_size)
         
     def forward(self, x):
         return self.projection(x) 
@@ -172,14 +181,13 @@ class Patches(nn.Module):
 class Loss(nn.Module):
     def __init__(self):
         super().__init__()
-        self.l1 = nn.L1Loss()
+        self.l1 = nn.SmoothL1Loss(reduction='none')
 
     def forward(self, predictions, targets):
-        error = torch.abs(targets - predictions)
-        var = torch.var(predictions)
-        l1_loss = self.l1(predictions * torch.exp(error * var), targets)
+        error = torch.abs(targets - predictions).detach() + 1.0
+        l1_loss = self.l1(predictions, targets)
 
-        return l1_loss 
+        return (l1_loss * error).mean()
     
 class DefocusRegressionCNN(nn.Module):
     def __init__(self):
@@ -213,7 +221,7 @@ class DefocusRegressionCNN(nn.Module):
 
         self.patch_res = nn.Conv2d(in_channels = 8, out_channels = 64, kernel_size = 1)
        
-        self.dropout = nn.Dropout(0.05)
+        self.dropout = nn.Dropout(0.5) 
         self.fft = FFT()
         self.fft_conv= nn.Conv2d(in_channels = 64, out_channels = 128, kernel_size = 1)
 
@@ -287,11 +295,11 @@ class DefocusRegressionCNN(nn.Module):
         x = self.fft_conv(x)
         x = F.relu(x)
 
+        x = self.ifft_shift(x)
+
         res = self.fft_res(activation)
         x = x + res
         activation = x
-
-        x = self.ifft_shift(x)
 
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
@@ -312,8 +320,9 @@ class Trainer:
         self.image_mean = image_mean
         self.label_std = label_std
         self.label_mean = label_mean
-        self.loss_fn = nn.L1Loss()
-        self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr=learning_rate) 
+        self.loss_fn = Loss() 
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate) 
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size = 10, gamma = 0.5)
         
         self.log_dir = f"Regression_mod_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir)
@@ -465,6 +474,7 @@ class Trainer:
             for epoch in range(epochs):
                 train_loss, train_accuracy = self.train_epoch(epoch)
                 val_loss, val_accuracy = self.validate(epoch)
+                # self.scheduler.step()
 
                 print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}',
                     f'Train Loss: {train_loss:.6f}', f'Val Accuracy: {val_accuracy}', f'Val Loss: {val_loss:.6f}')
@@ -492,6 +502,7 @@ class Trainer:
              for epoch in range(epochs):
                 train_loss, train_accuracy = self.train_epoch(epoch)
                 val_loss, val_accuracy = self.validate(epoch)
+                # self.scheduler.step()
 
                 print(f'Epoch [{epoch+1}/{epochs}] ', f'Train Accuracy: {train_accuracy}',
                     f'Train Loss: {train_loss:.6f}', f'Val Accuracy: {val_accuracy}', f'Val Loss: {val_loss:.6f}')
