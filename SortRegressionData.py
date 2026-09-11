@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
-# ##### globals #####
+##### globals #####
 path = r'/Users/trentstarkey/Desktop' 
 train_and_val_inputs = r'/Volumes/ThruFocusData/ThruFocusData/MixedBeams/ValData/30kV_ValData_Raw'
 train_and_val_outputs = r'/RegressionData_30kV_0.09nA_val'
