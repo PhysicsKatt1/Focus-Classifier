@@ -10,11 +10,14 @@ import matplotlib.pyplot as plt
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop' 
 train_and_val_inputs = r'/Volumes/ThruFocusData/ThruFocusData/MixedBeams/ValData/30kV_ValData_Raw'
-train_and_val_outputs = r'/RegressionData_30kV_0.09nA_val'
+train_and_val_outputs_tool = r'/RegressionData_30kV_0.09nA_val_tool'
+train_and_val_outputs_sim = r'/RegressionData_30kV_0.09nA_val_sim'
 
-os.makedirs(path + train_and_val_outputs, exist_ok = True)
+os.makedirs(path + train_and_val_outputs_tool, exist_ok = True)
+os.makedirs(path + train_and_val_outputs_sim, exist_ok = True)
 
-labels = []
+labels_tool = []
+labels_sim = []
 im_count = 0
 sharpness = []
 data_defocus = []
@@ -38,20 +41,19 @@ def fit_defocus():
                     defocus, stigx, stigy, _, _ = name.split('__')
 
                     if float(stigx) == 0.0 and float(stigy) == 0.0 and float(defocus) != 0:
-                        data_defocus.append(defocus)
+                        data_defocus.append(abs(float(defocus)))
                         sharpness.append(cv2.Laplacian(im, cv2.CV_64F).var())
 
             except:
                 continue
 
-    def linear_mod(x, a, b):
-        return a * x + b
 
-    params, _ = curve_fit(linear_mod, sharpness, data_defocus)
+    params = np.polyfit(sharpness, data_defocus, 2)
+    mod = np.poly1d(params)
 
-    return params, linear_mod, sharpness, data_defocus
+    return params, mod, sharpness, data_defocus
 
-def sort_data(params, linear_mod):
+def sort_data(params, mod):
     global im_count 
 
     for subfolders in os.listdir(train_and_val_inputs):
@@ -68,54 +70,56 @@ def sort_data(params, linear_mod):
                 if 'Focus_data_30000.0V_0.09nA__' in images:
                     name = images.removeprefix('Focus_data_30000.0V_0.09nA__')
                     defocus, stigx, stigy, _, _ = name.split('__')
+                    defocus = float(defocus)
 
                     # save original data
                     if float(stigx) == 0.0 and float(stigy) == 0.0 and float(defocus) != 0:
                         im_count += 1
                         
-                        im.save(path + train_and_val_outputs + '/' + str(im_count) + '.jpeg', format = 'JPEG')
-                        labels.append({'Image': str(im_count), 'Voltage': 30000.0, 'Current': 0.09, 
+                        im.save(path + train_and_val_outputs_tool + '/' + str(im_count) + '.jpeg', format = 'JPEG')
+                        labels_tool.append({'Image': str(im_count), 'Voltage': 30000.0, 'Current': 0.09, 
                                        'Defocus': defocus, 'StigX': stigx, 'StigY': stigy, 'Origin': 'Tool'})
 
                      # create and save simulated  data
-                    elif float(stigx) == 0.0 and float(stigy) == 0.0 and float(defocus) == 0:
+                    if float(stigx) == 0.0 and float(stigy) == 0.0 and float(defocus) == 0:
                         im = np.array(im)
                         for sigma in sigmas:
                             blurred_im = cv2.GaussianBlur(im, (0, 0), sigma)
                             blurred_im_sharpness = cv2.Laplacian(blurred_im, cv2.CV_64F).var()
-                            sim_defocus = linear_mod(blurred_im_sharpness, *params)
+                            sim_defocus = mod(blurred_im_sharpness)
     
                             im_count += 1
                             
-                            Image.fromarray(blurred_im).save(path + train_and_val_outputs + '/' + str(im_count) + '.jpeg', 
+                            Image.fromarray(blurred_im).save(path + train_and_val_outputs_sim + '/' + str(im_count) + '.jpeg', 
                                             format = 'JPEG')
-                            labels.append({'Image': str(im_count), 'Voltage': 30000.0, 'Current': 0.09, 
+                            labels_sim.append({'Image': str(im_count), 'Voltage': 30000.0, 'Current': 0.09, 
                                             'Defocus': sim_defocus, 'StigX': stigx, 'StigY': stigy, 
                                             'Origin': 'Sim', 'Sharpness':  blurred_im_sharpness})
         
             except:
                 continue
 
-    return labels
+    return labels_tool, labels_sim
 
 ##### call functions #####
-print('Creating linear fit for defocus vs sharpness')
-params, linear_mod, sharpness, data_defocus = fit_defocus()
+print('Creating model fit for defocus vs sharpness')
+params, mod, sharpness, data_defocus = fit_defocus()
 
 print('Sorting true data and creating simulated data.')
-labels = sort_data(params, linear_mod)
-all_labels = pd.DataFrame(labels)
-all_labels.to_csv(path + train_and_val_outputs + '/labels.csv')
+labels_tool, labels_sim = sort_data(params, mod)
+all_labels_tool = pd.DataFrame(labels_tool)
+all_labels_tool.to_csv(path + train_and_val_outputs_tool + '/labels.csv')
+all_labels_sim = pd.DataFrame(labels_sim)
+all_labels_sim.to_csv(path + train_and_val_outputs_sim + '/labels.csv')
 
 # check accuracy of linear fit and simulated data 
 dummy_x = np.linspace(min(sharpness), max(sharpness), 300)
-sim_data = labels[labels['Defocus'] == 'Sim']
 
 plt.scatter(sharpness, data_defocus, color = 'darkturquoise', label = 'True Data')
-plt.scatter(sim_data['Sharpness'], sim_data['Defocus'], color='red', label = 'Sim Data')
-plt.plot(dummy_x, *params, color = 'midnightblue', label = 'Model')
+plt.scatter(all_labels_sim['Sharpness'], all_labels_sim['Defocus'], color='red', label = 'Sim Data')
+plt.plot(dummy_x, mod(dummy_x), color = 'midnightblue', label = 'Model')
 plt.title('Defocus vs Laplace Sharpness Model Fit')
 plt.xlabel('Laplace Sharpness')
 plt.ylabel('Defocus')
 plt.legend(bbox_to_anchor = (0.9, 1.1))
-plt.savefig(path + train_and_val_outputs + '/model_fit.png',  bbox_inches= 'tight')
+plt.savefig(path + train_and_val_outputs_tool + '/model_fit.png',  bbox_inches= 'tight')
