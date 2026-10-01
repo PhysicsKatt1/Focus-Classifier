@@ -52,7 +52,6 @@ class PrepareImages():
         im_arr = np.array(self.im, dtype=np.float32) 
         im_arr = im_arr[border_crop:-border_crop, border_crop:-border_crop]
         im_arr = im_arr - np.mean(im_arr)
-        # im_arr = im_arr / np.std(im_arr)
 
         return im_arr
 
@@ -60,7 +59,7 @@ class PrepareImages():
         im_fft = np.fft.fft2(image)
         # im_fft = np.fft.fftshift(im_fft)  # uncomment only to plot fft
         # im = np.log1p(np.abs(im_fft))     # uncomment only to plot fft
-        im = np.abs(im_fft)
+        im = np.abs(im_fft) / im_fft.size
 
         return im, im_fft
 
@@ -90,21 +89,25 @@ class BeamStats():
 
         hfw = float(self.metadata['HFW']) * 1e6
         dx = hfw / int(self.metadata['ResolutionX'])
+        nyquist = 1 / (2 * dx)
 
         fx = np.fft.fftfreq(nx, d=dx)
         fy = np.fft.fftfreq(ny, d=dx)
         fx, fy = np.meshgrid(fx, fy)
 
         radius = np.sqrt(fx**2 + fy**2)
+        keep = radius < nyquist
+
         df = 1 / (max(nx, ny) * dx)
         radial_bin = np.floor(radius / df).astype(int)
-        counts = np.bincount(radial_bin.ravel())
-        sums = np.bincount(radial_bin.ravel(), weights=self.im.ravel())
 
-        valid = counts > 0
-        amp = sums[valid] / counts[valid]    
+        counts = np.bincount(radial_bin[keep], minlength=1)
+        sums = np.bincount(radial_bin[keep], weights=self.im[keep])
+
+        valid = counts >= 10
+        amp = sums[valid] / counts[valid]
         freq = np.arange(len(counts))[valid] * df
-        
+
         return amp, freq
 
     def beam_energy(self):
@@ -113,20 +116,22 @@ class BeamStats():
         hfw = float(self.metadata['HFW']) * 1e6
         resolution_x = int(self.metadata['ResolutionX'])
         dx = hfw / resolution_x
+        nyquist = 1 / (2 * dx)
 
         fx = np.fft.fftfreq(nx, d=dx)
         fy = np.fft.fftfreq(ny, d=dx)
         fx, fy = np.meshgrid(fx, fy)
 
         radius = np.sqrt(fx**2 + fy**2)
+        keep = radius < nyquist
         df = 1 / (max(nx, ny) * dx)
         radial_bin = np.floor(radius / df).astype(int)
 
         power = np.abs(self.im) ** 2
-        counts = np.bincount(radial_bin.ravel())
-        sums = np.bincount(radial_bin.ravel(), weights=power.ravel())
+        counts = np.bincount(radial_bin[keep], minlength=1)
+        sums = np.bincount(radial_bin[keep], weights=power[keep])
 
-        valid = counts > 0
+        valid = counts >= 10
         energy = sums[valid] / counts[valid] 
         freq_energy = np.arange(len(counts))[valid] * df
         bin_counts = counts[valid]
@@ -186,8 +191,88 @@ class SampleNormalizedEnergy:
 
         return self.df
 
+class IshitaniFit:
+    @staticmethod
+    def gaussian_fft(f, A, sigma):
+        return A * np.exp((-np.pi**2 * f**2 * sigma**2))
 
-    
+    @classmethod
+    def ishitani_fft(cls, f, A1, sigma1, A2, sigma2, A3, sigma3):
+        return (cls.gaussian_fft(f, A1, sigma1) + 
+                cls.gaussian_fft(f, A2, sigma2) + 
+                cls.gaussian_fft(f, A3, sigma3))
+
+    @staticmethod
+    def gaussian_intersection(A_a, sigma_a, A_b, sigma_b):
+        if A_a <= 0 or A_b <= 0 or np.isclose(sigma_a, sigma_b):
+            return np.nan
+
+        f_s = np.log(A_a / A_b) / (np.pi**2 * (sigma_a**2 - sigma_b**2))
+        return np.sqrt(f_s) if f_s > 0 else np.nan
+
+    def __init__(self, metadata_df):
+        self.df = metadata_df.copy() 
+
+    def run(self):
+        columns = ['Ishitani Core A', 'Ishitani Core Sigma',
+                   'Ishitani Mid A', 'Ishitani Mid Sigma',
+                   'Ishitani Tail A', 'Ishitani Tail Sigma',
+                   'Ishitani Tail Upper Frequency',
+                   'Ishitani Mid Upper Frequency',
+                   'Nyquist Frequency']
+
+        for column in columns:
+            self.df[column] = np.nan
+
+        self.df['Ishitani Ordered'] = False
+        focused = self.df[self.df['Labeled Offset'] == 0]
+
+        for idx, row in focused.iterrows():
+            dx = float(row['HFW']) * 1e6 / int(row['ResolutionX'])   # µm per pixel
+            nyquist = 1 / (2 * dx)
+            
+            freq = np.asarray(row['Frequency'], dtype=float)
+            amplitude = np.asarray(row['Amplitude'], dtype=float)
+
+            try:
+                # start_freq = 0.5
+                start_freq = 0.5
+                start = np.searchsorted(freq, start_freq)
+                freq = freq[start:]
+                amplitude = amplitude[start:]
+
+                # low  = [0, 0.60, 0, 0.25, 0, 0.040]
+                # high = [np.inf, 1.20, np.inf, 0.50, np.inf, 0.100]
+                low  = [0, 0.60, 0, 0.25, 0, 0.000]
+                high = [np.inf, 1.20, np.inf, 0.50, np.inf, 0.100]
+
+                popt, _ = curve_fit(self.ishitani_fft, freq, amplitude, bounds = (low, high),
+                                    maxfev=100000)
+            except:
+                continue
+
+            A1, s1, A2, s2, A3, s3 = popt
+            comps = [(s1, A1), (s2, A2), (s3, A3)]
+            (s_core, A_core), (s_mid, A_mid), (s_tail, A_tail) = sorted(comps, key=lambda x: x[0])
+
+            self.df.at[idx, 'Ishitani Core A'] = A_core
+            self.df.at[idx, 'Ishitani Core Sigma'] = s_core
+            self.df.at[idx, 'Ishitani Mid A'] = A_mid
+            self.df.at[idx, 'Ishitani Mid Sigma'] = s_mid
+            self.df.at[idx, 'Ishitani Tail A'] = A_tail
+            self.df.at[idx, 'Ishitani Tail Sigma'] = s_tail
+
+            tail_upper = self.gaussian_intersection(A_mid, s_mid, A_tail, s_tail)
+            mid_upper = self.gaussian_intersection(A_core, s_core, A_mid, s_mid)
+            core_upper = nyquist
+
+            self.df.at[idx, 'Ishitani Tail Upper Frequency'] = tail_upper
+            self.df.at[idx, 'Ishitani Mid Upper Frequency'] = mid_upper
+            self.df.at[idx, 'Nyquist Frequency'] = core_upper
+            self.df.at[idx, 'Ishitani Ordered'] = bool(tail_upper < mid_upper < core_upper)
+
+        return self.df, start_freq, low, high
+
 class BeamPlotter:
     def __init__(self, metadata_df, output_path, pipeline_results_df=None, pipeline_instance=None):
         self.df = metadata_df.copy()
@@ -458,9 +543,69 @@ class BeamPlotter:
                                 sample=d_plot['Labeled Offset'], current=d_plot['Current'], 
                                 ylabel=f'% Energy Lost', xlabel='Spatial Frequency (cycles/µm)', 
                                 title='Mean Percent Energy Lost per Frequency')
-        pp.set(yscale='log')
+        # pp.set(yscale='log')
         pp.savefig(self.output_path + '/Mean_samp_norm_energydiff.jpeg', bbox_inches='tight')
         plt.close(pp.figure)
+
+    def ishitani_fit_samples(self, n, random_state=None):
+        stats = pd.read_csv(path + outputs + '/Ishitani_fits.csv').tail(3)
+
+        focused = self.df[self.df['Labeled Offset'] == 0].copy()
+        focused = focused.dropna(subset=['Ishitani Core A'])   # drop failed fits
+
+        rng = np.random.default_rng(random_state)
+        n_samples = min(n, len(focused))
+        indices = rng.choice(len(focused), size=n_samples, replace=False)
+
+        for i in indices:
+            row = focused.iloc[i]
+            freq = np.asarray(row['Frequency'], dtype=float)
+            amp = np.asarray(row['Amplitude'], dtype=float)
+
+            current_stats = stats[stats['Current'].astype(str) == str(row['Current'])]
+            mean_tail = current_stats['Tail Mean'].iloc[0]
+            std_tail = current_stats['Tail Std'].iloc[0]
+            mean_mid = current_stats['Mid Mean'].iloc[0]
+            std_mid = current_stats['Mid Std'].iloc[0]
+            mean_nyquist = current_stats['Nyquist Mean'].iloc[0]
+            
+            fit = IshitaniFit.ishitani_fft(freq,
+                                        row['Ishitani Tail A'], row['Ishitani Tail Sigma'],
+                                        row['Ishitani Mid A'], row['Ishitani Mid Sigma'],
+                                        row['Ishitani Core A'], row['Ishitani Core Sigma'])
+
+            plt.figure(figsize=(8, 5))
+            plt.plot(freq, amp, label='Empirical', color='mediumslateblue')
+            plt.plot(freq, fit, label='Ishitani Fit', color='lawngreen')
+
+            # empiracle 
+            plt.axvline(row['Ishitani Tail Upper Frequency'], linestyle=':',
+                        label='Tail/Mid Boundary', color='black')
+            plt.axvline(row['Ishitani Mid Upper Frequency'], linestyle='--',
+                        label='Mid/Core Boundary', color='black')
+            plt.axvline(row['Nyquist Frequency'], linestyle='-.',
+                                    label='Nyquist Frequency', color='black')
+
+            # mean
+            plt.axvline(mean_tail, linestyle=':',
+                        label='Mean Tail/Mid Boundary, STD = ' + str(std_tail), color='fuchsia')
+            plt.axvline(mean_mid, linestyle='--',
+                        label='Mean Mid/Core Boundary, STD = ' + str(std_mid), color='fuchsia')
+            plt.axvline(mean_nyquist, linestyle='-.',
+                                    label='Mean Nyquist Frequency', color='fuchsia')
+            
+            plt.xlabel('Spatial Frequency (cycles/µm)')
+            plt.ylabel('Amplitude')
+            plt.title('Ishitani Model Fit for ' + row['Current'] + ' ' + row['Sample'] + ' File ' 
+                      + row['File'])
+            plt.legend(bbox_to_anchor = (1.1, 1.0))
+            plt.yscale('log')
+            plot_bound = np.max([int(row['Nyquist Frequency']), mean_nyquist])
+            plt.xlim(0, plot_bound + 3)
+            plt.ylim(amp[len(freq) - 1]  , np.max(amp))
+            plt.savefig(self.output_path + '/Sampled_Ishitani_fit_' + row['Sample'] + '_' + row['File'] +
+                        '.jpeg', bbox_inches='tight')
+            plt.close()
 
     def run(self):
         groups = self.df.groupby(['Current', 'Labeled Offset'])
@@ -471,7 +616,7 @@ class BeamPlotter:
         self.df['Mean Sample Normalized Energy'] = groups['Sample Normalized Energy'].transform(self.mean_array)
         self.df['Mean Energy Frequency'] = groups['Energy Frequency'].transform(self.mean_array)
         self.df['Mean Percent Energy Lost'] = groups['Percent Energy Lost'].transform(self.mean_array)
-
+        
         offset_order = sorted(self.df['Labeled Offset'].dropna().unique())
 
         first_rows = self.df.drop_duplicates(subset=['Sample', 'Current', 'Labeled Offset']).copy()
@@ -483,6 +628,7 @@ class BeamPlotter:
         first_rows['Subset Mean Sample Normalized Amplitude'] = subset_groups['Sample Normalized Amplitude'].transform(self.mean_array)
         first_rows['Subset Mean Sample Normalized Energy'] = subset_groups['Sample Normalized Energy'].transform(self.mean_array)
         first_rows['Subset Mean Percent Energy Lost'] = subset_groups['Percent Energy Lost'].transform(self.mean_array)
+
 
         average_rows = first_rows.drop_duplicates(subset=['Current', 'Labeled Offset']).copy()
         average_rows['Sample'] = 'Average'
@@ -502,7 +648,7 @@ class BeamPlotter:
         total_rows['Percent Energy Lost'] = total_rows['Mean Percent Energy Lost']
         total_rows['Energy'] = total_rows['Mean Energy']
         total_rows['Energy Frequency'] = total_rows['Mean Energy Frequency']
-
+        
         # plot
         # first_rows   = self.normalize(first_rows,   ['Amplitude', 'Energy'])
         # average_rows = self.normalize(average_rows, ['Amplitude', 'Energy'])
@@ -510,12 +656,13 @@ class BeamPlotter:
 
         # self.plot_sample_profiles(first_rows, average_rows, total_rows)
         # self.plot_mean_frequency_profiles(total_rows, offset_order)
-        self.plot_mean_spatial_energy(total_rows, offset_order)
+        # self.plot_mean_spatial_energy(total_rows, offset_order)
         # self.plot_mean_sample_norm_amp(total_rows, offset_order)
         # self.plot_sample_norm_amp_profiles(offset_order, n_samples=3)
-        self.plot_mean_sample_norm_energy(total_rows, offset_order)
+        # self.plot_mean_sample_norm_energy(total_rows, offset_order)
         # self.plot_sample_norm_energy_profiles(offset_order, n_samples=3)
-        self.plot_mean_sample_norm_energydiff(total_rows, offset_order)
+        # self.plot_mean_sample_norm_energydiff(total_rows, offset_order)
+        self.ishitani_fit_samples(n=5)
 
 ##### main execution block #####
 meta = []
@@ -536,11 +683,12 @@ for folder in os.listdir(path + inputs):
                 image_path = path + inputs + '/' + folder + '/' + file + '/' + image
                 image_name = image.removesuffix('.tif')
 
-                # 1. Prepare images and extract metadata
+                # prepare images and extract metadata
                 metadata, im, im_fft = PrepareImages(image_path, file, sample).run()
 
-                # 2. Calculate beam profile and spatial energy stats
-                amp, freq, energy, freq_energy, bin_counts = BeamStats(im, metadata.iloc[0], im_fft).run()
+                # calculate beam profile and spatial energy stats
+                (amp, freq, energy, freq_energy, 
+                 bin_counts) = BeamStats(im, metadata.iloc[0], im_fft).run()
     
                 metadata['Amplitude'] = [amp.tolist()]
                 metadata['Frequency'] = [freq.tolist()]
@@ -562,6 +710,29 @@ all_metadata = normalizer.run()
 
 energy_normalizer = SampleNormalizedEnergy(metadata_df=all_metadata)
 all_metadata = energy_normalizer.run()
+
+##### calculate Ishitani beam regions in frequency space #####
+ishitani = IshitaniFit(metadata_df=all_metadata)
+all_metadata, start_freq, low, high = ishitani.run()
+
+focused_data = all_metadata[all_metadata['Labeled Offset'] == 0]
+focused_stats = focused_data.groupby('Current')
+
+stats = focused_stats.agg(**{
+    'Tail Mean': ('Ishitani Tail Upper Frequency', 'mean'),
+    'Tail Std':  ('Ishitani Tail Upper Frequency', 'std'),
+    'Tail Var':  ('Ishitani Tail Upper Frequency', 'var'),
+    'Mid Mean':  ('Ishitani Mid Upper Frequency', 'mean'),
+    'Mid Std':   ('Ishitani Mid Upper Frequency', 'std'),
+    'Mid Var':   ('Ishitani Mid Upper Frequency', 'var'),
+    'Nyquist Mean':     ('Nyquist Frequency', 'mean')}).reset_index()
+
+stats['Low Bounds'] = str(low)
+stats['High Bounds'] = str(high)
+stats['Start Freq'] = start_freq
+
+file = path + outputs + '/Ishitani_fits.csv'
+stats.to_csv(file, mode='a', header=not os.path.exists(file), index=False)
 
 ##### save metadata #####
 all_metadata.to_csv(path + outputs + '/all_meta_data.csv', index=False)
