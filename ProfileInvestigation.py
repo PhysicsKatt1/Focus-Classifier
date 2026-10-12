@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 import pymc as pm
 import pytensor.tensor as pt
 from matplotlib.lines import Line2D
+import sympy as sp
 
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop'
@@ -20,6 +21,7 @@ inputs = '/Offsets'
 outputs = '/Offsets_FFTs'
 test = '/Offsets_Test'
 border_crop = 3
+size = 25
 
 ##### define classes #####
 class PrepareImages():
@@ -46,7 +48,7 @@ class PrepareImages():
             'ResolutionY': config['Image']['ResolutionY'],
             'DwellTime': config['Scan']['Dwelltime'],
             'Voltage': config['IBeam']['HV'],
-            'Current': config['IBeam']['BeamCurrent'],
+            'Current': float(config['IBeam']['BeamCurrent']),
             'L2': xml_root.find('Optics/FibL2Voltage').text}
         return metadata
 
@@ -194,22 +196,25 @@ class SampleNormalizedEnergy:
 
 class IshitaniFit:
     @staticmethod
-    def gaussian_fft(f, A, sigma):
-        return A * np.exp((-np.pi**2 * f**2 * sigma**2))
-
-    @classmethod
-    def ishitani_fft(cls, f, A1, sigma1, A2, sigma2, A3, sigma3):
-        return (cls.gaussian_fft(f, A1, sigma1) + 
-                cls.gaussian_fft(f, A2, sigma2) + 
-                cls.gaussian_fft(f, A3, sigma3))
-
-    @staticmethod
     def gaussian_intersection(A_a, sigma_a, A_b, sigma_b):
         if A_a <= 0 or A_b <= 0 or np.isclose(sigma_a, sigma_b):
             return np.nan
 
         f_s = np.log(A_a / A_b) / (np.pi**2 * (sigma_a**2 - sigma_b**2))
         return np.sqrt(f_s) if f_s > 0 else np.nan
+
+    @staticmethod
+    def empirical_sigma(freq, mags, upper, lower):
+        half_max = (mags[upper] - mags[lower]) / 2
+        half_max_idx = np.argmin(np.abs(mags - half_max))
+
+        fwhm = 2 * (freq[half_max_idx] - freq[upper])   # multiply by 2 to account for Gaussian < 0 
+
+        return 0.375 / fwhm       
+
+    @staticmethod
+    def window_peaks(grads, size=size):
+        return np.array([s + np.argmax(grads[s:s + size]) for s in range(0, len(grads), size)])
 
     def __init__(self, metadata_df, draws=1000, tune=1000, chains=4, seed=0):
         self.df = metadata_df.copy() 
@@ -235,21 +240,37 @@ class IshitaniFit:
         for current, group in focused.groupby('Current'):
             freq = np.asarray(BeamPlotter.mean_array(group['Frequency'])[0], dtype=float)
             mags = np.asarray(BeamPlotter.mean_array(group['Amplitude'])[0], dtype=float)
-            sd = 0.1 * mags
+            
+            grads = np.gradient(np.gradient(mags, freq), freq)
+            cand = self.window_peaks(grads)                         
+            idx = np.sort(cand[np.argsort(grads[cand])[-3:]]) 
+
+            if mags[0] == mags[idx][0] or mags[idx][0] < size:
+                idx = idx[1:]
+
+            else:
+                idx = idx[:2]
+
+            print(idx)
 
             with pm.Model():
-                A1 = pm.HalfNormal('A1', sigma=2.0)
-                A2 = pm.HalfNormal('A2', sigma=0.3)
-                A3 = pm.HalfNormal('A3', sigma=0.05)
-                s1 = pm.Uniform('s1', lower=0.30, upper=0.90)
-                s2 = pm.Uniform('s2', lower=0.10, upper=0.30)
-                s3 = pm.Uniform('s3', lower=0.0001, upper=0.10)
+                A1 = pm.HalfNormal('A1', sigma=mags[0])
+                A2 = pm.HalfNormal('A2', sigma=mags[idx][0])
+                A3 = pm.HalfNormal('A3', sigma=mags[idx][1])
+
+                s3 = pm.HalfNormal('s3', sigma=self.empirical_sigma(freq, mags, idx[1], len(mags) - 1))
+                s2 = pm.Deterministic('s2', s3 + pm.HalfNormal('d2', 
+                                       sigma=self.empirical_sigma(freq, mags, idx[0], idx[1])))
+                s1 = pm.Deterministic('s1', s2 + pm.HalfNormal('d1', 
+                                         sigma=self.empirical_sigma(freq, mags, 0, idx[0])))
+
+                sigma = pm.HalfNormal('sigma', sigma = 1.0) 
 
                 model = (A1 * pt.exp(-np.pi**2 * freq**2 * s1**2) +
-                         A2 * pt.exp(-np.pi**2 * freq**2 * s2**2) +
-                         A3 * pt.exp(-np.pi**2 * freq**2 * s3**2))
-
-                pm.Normal('obs', mu=model, sigma=sd, observed=mags)
+                        A2 * pt.exp(-np.pi**2 * freq**2 * s2**2) +
+                        A3 * pt.exp(-np.pi**2 * freq**2 * s3**2))
+                 
+                pm.LogNormal('obs', mu=pt.log(model), sigma=sigma, observed=mags)
 
                 idata = pm.sample(draws=self.draws, tune=self.tune, chains=self.chains,
                                   target_accept=0.9, random_seed=self.seed)
@@ -272,6 +293,104 @@ class IshitaniFit:
 
         return self.df
 
+class RegionalShift:
+    @staticmethod
+    def empirical_sigma(freq, mags, upper, lower):
+        half_max = (mags[upper] - mags[lower]) / 2
+        half_max_idx = np.argmin(np.abs(mags - half_max))
+
+        fwhm = 2 * (freq[half_max_idx] - freq[upper])   # multiply by 2 to account for Gaussian < 0 
+
+        return 0.375 / max(fwhm, 1e-9)        
+    
+    @staticmethod
+    def window_peaks(grads, size=size):
+        return np.array([s + np.argmax(grads[s:s + size]) for s in range(0, len(grads), size)])
+
+    def __init__(self, metadata_df, draws=1000, tune=1000, chains=4, seed=0):
+        self.df = metadata_df.copy() 
+        self.draws = draws
+        self.tune = tune
+        self.chains = chains
+        self.seed = seed
+        self.idata = {}     
+
+    def run(self):
+        for col in ['A1', 'A2', 'A3', 's1', 's2', 's3']:
+            self.df[col] = np.nan
+
+        focus_amps = {}
+        ordered = self.df.sort_values('Labeled Offset', key=lambda s: s != 0)
+
+        for row_id, row in ordered.iterrows():
+            key = (row['Sample'], row['File'], row['Current'])
+            fixed = None if row['Labeled Offset'] == 0 else focus_amps.get(key)
+
+            freq = np.asarray(row['Frequency'], dtype=float)
+            mags = np.asarray(row['Amplitude'], dtype=float)
+
+            grads = np.gradient(np.gradient(mags, freq), freq)
+            cand = self.window_peaks(grads)                         
+            idx = np.sort(cand[np.argsort(grads[cand])[-3:]]) 
+
+            if mags[0] == mags[idx][0] or mags[idx][0] < size:
+                idx = idx[1:]
+            
+            else:
+                idx = idx[:2]
+        
+            with pm.Model():
+                if fixed is None:
+                    A1 = pm.HalfNormal('A1', sigma=mags[0])
+                    A2 = pm.HalfNormal('A2', sigma=mags[idx][0])
+                    A3 = pm.HalfNormal('A3', sigma=mags[idx][1])
+                else:
+                    A1, A2, A3 = fixed
+
+                s3 = pm.HalfNormal('s3', sigma=self.empirical_sigma(freq, mags, idx[1], len(mags) - 1))
+                s2 = pm.Deterministic('s2', s3 + pm.HalfNormal('d2', 
+                                        sigma=self.empirical_sigma(freq, mags, idx[0], idx[1])))
+                s1 = pm.Deterministic('s1', s2 + pm.HalfNormal('d1', 
+                    sigma=self.empirical_sigma(freq, mags, 0, idx[0])))
+
+                sigma = pm.HalfNormal('sigma', sigma=1.0)
+
+                terms = pt.stack([
+                    pt.log(A1) - np.pi**2 * freq**2 * s1**2,
+                    pt.log(A2) - np.pi**2 * freq**2 * s2**2,
+                    pt.log(A3) - np.pi**2 * freq**2 * s3**2])
+
+                pm.LogNormal('obs', mu=pt.logsumexp(terms, axis=0), sigma=sigma, observed=mags)
+
+                idata = pm.sample(draws=self.draws, tune=self.tune, chains=self.chains,
+                                  target_accept=0.9, random_seed=self.seed)
+
+            post = idata.posterior.median(('chain', 'draw'))
+            s1, s2, s3 = [float(post[k]) for k in ['s1', 's2', 's3']]
+            if fixed is None:
+                A1, A2, A3 = [float(post[k]) for k in ['A1', 'A2', 'A3']]
+            if row['Labeled Offset'] == 0:
+                focus_amps[key] = (A1, A2, A3)
+
+            for k, v in zip(['A1', 's1', 'A2', 's2', 'A3', 's3'], [A1, s1, A2, s2, A3, s3]):
+                self.df.loc[row_id, k] = v
+
+        self.df['Sum A'] = self.df[['s1', 's2', 's2']].sum(axis=1)
+        self.df['Tail Frac'] = self.df['s1'] / self.df['Sum A']
+        self.df['Mid Frac']  = self.df['s2'] / self.df['Sum A']
+        self.df['Core Frac'] = self.df['s3'] / self.df['Sum A']
+
+        keys = ['Sample', 'File', 'Current']
+        fracs = ['Tail Frac', 'Mid Frac', 'Core Frac']
+        focused = (self.df[self.df['Labeled Offset'] == 0].drop_duplicates(subset=keys)
+                .set_index(keys)[fracs].add_suffix(' Focus'))
+        self.df = self.df.join(focused, on=keys)
+
+        for name in ['Tail', 'Mid', 'Core']:
+            self.df[f'{name} Amplitude Change'] = 100 * (self.df[f'{name} Frac'] - self.df[f'{name} Frac Focus'])
+
+        return self.df
+
 class BeamPlotter:
     def __init__(self, metadata_df, output_path):
         self.df = metadata_df.copy()
@@ -291,6 +410,12 @@ class BeamPlotter:
     def mean_array(s):
         n = min(len(a) for a in s)
         return [np.mean([a[:n] for a in s], axis=0).tolist()] * len(s)
+
+    @staticmethod
+    def ishitani_curve(f, A1, s1, A2, s2, A3, s3):
+        f = np.asarray(f, dtype=float)
+        return sum(A * np.exp(-np.pi**2 * f**2 * s**2)
+               for A, s in [(A1, s1), (A2, s2), (A3, s3)])
 
     @staticmethod
     def profile_plot(freq, amp, sample, current, ylabel='Normalized Signal', 
@@ -421,6 +546,21 @@ class BeamPlotter:
                                     sample=d_plot['Labeled Offset'], current=d_plot['Current'], 
                                     ylabel='Mean Magnitude Squared per Frequency Bin', xlabel='Spatial Frequency (cycles/µm)', 
                                     title='Mean Sample Normalized Power')
+            bounds = {float(r['Current']): (r['Ishitani Tail Upper Frequency'],
+                                            r['Ishitani Mid Upper Frequency'])
+                      for _, r in d.drop_duplicates(subset='Current').iterrows()}
+
+            for current, ax in pp.axes_dict.items():
+                tail_upper, mid_upper = bounds[current]
+                ax.axvline(tail_upper, linestyle=':', color='black')
+                ax.axvline(mid_upper, linestyle='--', color='black')
+
+            legend_data = {t.get_text(): h for t, h in zip(pp._legend.get_texts(), pp._legend.legend_handles)}
+            legend_data['Tail Upper Bound'] = Line2D([], [], linestyle=':', color='black')
+            legend_data['Mid Upper Bound'] = Line2D([], [], linestyle='--', color='black')
+            pp._legend.remove()
+            pp.add_legend(legend_data=legend_data)
+
             pp.set(yscale='log')
             pp.savefig(self.output_path + '/Mean_samp_norm_energy.jpeg', bbox_inches='tight')
             plt.close(pp.figure)
@@ -555,10 +695,11 @@ class BeamPlotter:
         for _, row in focused.iterrows():
             freq = np.asarray(row['Mean Frequency'], dtype=float)
             amp = np.asarray(row['Mean Amplitude'], dtype=float)
-            fit = IshitaniFit.ishitani_fft(freq,
-                                           row['Ishitani Tail A'], row['Ishitani Tail Sigma'],
-                                           row['Ishitani Mid A'], row['Ishitani Mid Sigma'],
-                                           row['Ishitani Core A'], row['Ishitani Core Sigma'])
+            fit = self.ishitani_curve(freq,
+                          row['Ishitani Tail A'], row['Ishitani Tail Sigma'],
+                          row['Ishitani Mid A'], row['Ishitani Mid Sigma'],
+                          row['Ishitani Core A'], row['Ishitani Core Sigma'])
+            
             for label, y in [('Empirical', amp), ('Ishitani Fit', fit)]:
                 plot_freq.extend(freq)
                 plot_amp.extend(y)
@@ -588,6 +729,31 @@ class BeamPlotter:
         pp.add_legend(legend_data=legend_data)
 
         pp.savefig(self.output_path + '/Ishitani_fits.jpeg', bbox_inches='tight')
+        plt.close(pp.figure)
+
+    def redistribution_with_defocus(self):
+        ids = ['Current', 'Labeled Offset', 'File']
+        d_all = self.df.copy()
+
+        def melt(cols, value_name):
+            d = d_all.melt(id_vars=ids, value_vars=cols, var_name='Region', value_name=value_name)
+            d['Region'] = d['Region'].str.split(' ').str[0]
+            return d
+
+        shifts = melt(['Tail Amplitude Change', 'Mid Amplitude Change', 'Core Amplitude Change'],
+                    'Amplitude Change')
+        
+        pp = sns.relplot(data=shifts, kind='line', x='Labeled Offset', y='Amplitude Change',
+                        hue='Region', col='Current', estimator='mean', errorbar='sd',
+                        marker='o', palette='cool')
+        for ax in pp.axes.flat:
+            ax.axhline(0, linestyle='--', color='black')
+        pp.set_xlabels('')
+        pp.figure.text(0.5, 0.02, 'Defocus Offset (V)', ha='center', va='center')
+        pp.set_titles('Current = {col_name}')
+        pp.figure.subplots_adjust(top=0.84)
+        pp.figure.suptitle('Percent Ishitiani Fit Amplitude Change from Focus')
+        pp.savefig(self.output_path + '/Ishitani_fraction_shifts.jpeg', bbox_inches='tight')
         plt.close(pp.figure)
 
     def run(self):
@@ -642,10 +808,11 @@ class BeamPlotter:
         # self.plot_mean_spatial_energy(total_rows, offset_order)
         # self.plot_mean_sample_norm_amp(total_rows, offset_order)
         # self.plot_sample_norm_amp_profiles(offset_order, n_samples=3)
-        # self.plot_mean_sample_norm_energy(total_rows, offset_order)
+        self.plot_mean_sample_norm_energy(total_rows, offset_order)
         # self.plot_sample_norm_energy_profiles(offset_order, n_samples=3)
         # self.plot_mean_sample_norm_energydiff(total_rows, offset_order)
         self.ishitani_fits()
+        self.redistribution_with_defocus()
 
 ##### main execution block #####
 meta = []
@@ -687,6 +854,7 @@ for folder in os.listdir(path + inputs):
 all_metadata = pd.concat(meta, ignore_index=True)
 
 ##### compute sample normalized profiles #####
+print('Calculating sample-normalized mean radially binned frequency magnitudes.')
 normalizer = SampleNormalizedAmplitude(metadata_df=all_metadata)
 all_metadata = normalizer.run()
 
@@ -694,12 +862,22 @@ energy_normalizer = SampleNormalizedEnergy(metadata_df=all_metadata)
 all_metadata = energy_normalizer.run()
 
 ##### calculate Ishitani beam regions in frequency space #####
+print('Finding Ishitani frequency regions.')
 ishitani = IshitaniFit(metadata_df=all_metadata)
 all_metadata = ishitani.run()
+
+##### compare Ishitani amplitudes #####
+print('Calculating regional beam changes by defocus offset.')
+regional = RegionalShift(all_metadata)
+all_metadata = regional.run()
 
 ##### save metadata #####
 all_metadata.to_csv(path + outputs + '/all_meta_data.csv', index=False)
 
 ##### plot #####
+print('Plotting.')
 plotter = BeamPlotter(metadata_df = all_metadata, output_path = path + outputs)
 plotter.run()
+
+print('Bye!')
+
