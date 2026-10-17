@@ -13,7 +13,10 @@ import xml.etree.ElementTree as ET
 import pymc as pm
 import pytensor.tensor as pt
 from matplotlib.lines import Line2D
-import sympy as sp
+from scipy.optimize import brentq
+from scipy.special import kv
+from scipy.signal.windows import tukey
+from scipy.ndimage import median_filter
 
 ##### globals #####
 path = r'/Users/trentstarkey/Desktop'
@@ -21,9 +24,13 @@ inputs = '/Offsets'
 outputs = '/Offsets_FFTs'
 test = '/Offsets_Test'
 border_crop = 3
-size = 25
+alpha = 0.0
 
 ##### define classes #####
+def mean_profile(group, freq_col, val_col, n=5000):
+    grid = np.linspace(0, min(f[-1] for f in group[freq_col]), n)
+    return grid, np.mean([np.interp(grid, f, v) for f, v in zip(group[freq_col], group[val_col])], axis=0)
+
 class PrepareImages():
     def __init__(self, img_path, file_id, sample_name):
         self.img_path = img_path
@@ -60,7 +67,14 @@ class PrepareImages():
         return im_arr
 
     def fft_imgs(self, image):
-        im_fft = np.fft.fft2(image)
+        ny, nx = image.shape
+        window_y = tukey(ny, alpha=alpha)
+        window_x = tukey(nx, alpha=alpha)
+        window_2d = np.outer(window_y, window_x)
+
+        windowed_image = image * window_2d
+        im_fft = np.fft.fft2(windowed_image)
+        # im_fft = np.fft.fft2(image)
         # im_fft = np.fft.fftshift(im_fft)  # uncomment only to plot fft
         # im = np.log1p(np.abs(im_fft))     # uncomment only to plot fft
         im = np.abs(im_fft) / im_fft.size
@@ -86,6 +100,7 @@ class BeamStats():
     def __init__(self, im, metadata):
         self.im = im
         self.metadata = metadata
+        self.df = metadata.copy()
 
     def beam_profiles(self):
         ny, nx = self.im.shape
@@ -103,292 +118,57 @@ class BeamStats():
 
         df = 1 / (max(nx, ny) * dx)
         radial_bin = np.floor(radius / df).astype(int)
-
         counts = np.bincount(radial_bin[keep], minlength=1)
-        sums = np.bincount(radial_bin[keep], weights=self.im[keep])
-
         valid = counts >= 10
-        amp = sums[valid] / counts[valid]
+
         freq = np.arange(len(counts))[valid] * df
 
-        return amp, freq
+        power = (self.im)**2
+        sums_power = np.bincount(radial_bin[keep], weights=power[keep])
+        energy = sums_power[valid] / counts[valid]
+        amp = np.sqrt(energy)
 
-    def beam_energy(self):
-        ny, nx = self.im.shape
+        freq_raw = radial_bin[keep] * df
+        amp_raw = self.im[keep]
+        energy_raw = amp_raw**2
 
-        hfw = float(self.metadata['HFW']) * 1e6
-        resolution_x = int(self.metadata['ResolutionX'])
-        dx = hfw / resolution_x
-        nyquist = 1 / (2 * dx)
-
-        fx = np.fft.fftfreq(nx, d=dx)
-        fy = np.fft.fftfreq(ny, d=dx)
-        fx, fy = np.meshgrid(fx, fy)
-
-        radius = np.sqrt(fx**2 + fy**2)
-        keep = radius < nyquist
-        df = 1 / (max(nx, ny) * dx)
-        radial_bin = np.floor(radius / df).astype(int)
-
-        power = np.abs(self.im) ** 2
-        counts = np.bincount(radial_bin[keep], minlength=1)
-        sums = np.bincount(radial_bin[keep], weights=power[keep])
-
-        valid = counts >= 10
-        energy = sums[valid] / counts[valid] 
-        freq_energy = np.arange(len(counts))[valid] * df
-        bin_counts = counts[valid]
-
-        return energy, freq_energy, bin_counts
+        return amp, freq, energy, counts[valid], amp_raw, energy_raw, freq_raw
 
     def run(self):
-        amp, freq = self.beam_profiles()
-        energy, freq_energy, bin_counts = self.beam_energy()
-        return amp, freq, energy, freq_energy, bin_counts
-
-class SampleNormalizedAmplitude:
-    def __init__(self, metadata_df):
-        self.df = metadata_df.copy()
-
-    def run(self):
-        self.df['Sample Normalized Amplitude'] = None
-
-        for (sample, file, current), group in self.df.groupby(['Sample', 'File', 'Current']):
-            focused_row = group[group['Labeled Offset'] == 0].iloc[0]
-            focused_amp = np.asarray(focused_row['Amplitude'], dtype=float).ravel()
-            focused_freq = np.asarray(focused_row['Frequency'], dtype=float).ravel()
-
-            for idx, row in group.iterrows():
-                amp = np.asarray(row['Amplitude'], dtype=float).ravel()
-                freq = np.asarray(row['Frequency'], dtype=float).ravel()
-                amp_matched = np.interp(focused_freq, freq, amp)
-
-                ratio = amp_matched / focused_amp
-                self.df.at[idx, 'Sample Normalized Amplitude'] = ratio.tolist()
-
-        return self.df
-
-class SampleNormalizedEnergy:
-    def __init__(self, metadata_df):
-        self.df = metadata_df.copy()
-
-    def run(self):
-        self.df['Sample Normalized Energy'] = None
-        self.df['Percent Energy Lost'] = None
-
-        for (sample, file, current), group in self.df.groupby(['Sample', 'File', 'Current']):
-            focused_row = group[group['Labeled Offset'] == 0].iloc[0]
-            focused_e = np.asarray(focused_row['Energy'], dtype=float).ravel()
-            focused_freq = np.asarray(focused_row['Energy Frequency'], dtype=float).ravel()
-
-            for idx, row in group.iterrows():
-                e = np.asarray(row['Energy'], dtype=float).ravel()
-                freq = np.asarray(row['Energy Frequency'], dtype=float).ravel()
-                energy_matched = np.interp(focused_freq, freq, e)
-
-                ratio = energy_matched / focused_e
-                self.df.at[idx, 'Sample Normalized Energy'] = ratio.tolist()
-
-                percent_lost = 100 * (1 - ratio)
-                self.df.at[idx, 'Percent Energy Lost'] = percent_lost.tolist()
-
-        return self.df
-
-class IshitaniFit:
-    @staticmethod
-    def gaussian_intersection(A_a, sigma_a, A_b, sigma_b):
-        if A_a <= 0 or A_b <= 0 or np.isclose(sigma_a, sigma_b):
-            return np.nan
-
-        f_s = np.log(A_a / A_b) / (np.pi**2 * (sigma_a**2 - sigma_b**2))
-        return np.sqrt(f_s) if f_s > 0 else np.nan
-
-    @staticmethod
-    def empirical_sigma(freq, mags, upper, lower):
-        half_max = (mags[upper] - mags[lower]) / 2
-        half_max_idx = np.argmin(np.abs(mags - half_max))
-
-        fwhm = 2 * (freq[half_max_idx] - freq[upper])   # multiply by 2 to account for Gaussian < 0 
-
-        return 0.375 / fwhm       
-
-    @staticmethod
-    def window_peaks(grads, size=size):
-        return np.array([s + np.argmax(grads[s:s + size]) for s in range(0, len(grads), size)])
-
-    def __init__(self, metadata_df, draws=1000, tune=1000, chains=4, seed=0):
-        self.df = metadata_df.copy() 
-        self.draws = draws
-        self.tune = tune
-        self.chains = chains
-        self.seed = seed
-        self.idata = {}     
-
-    def run(self):
-        columns = ['Ishitani Core A', 'Ishitani Core Sigma',
-                   'Ishitani Mid A', 'Ishitani Mid Sigma',
-                   'Ishitani Tail A', 'Ishitani Tail Sigma',
-                   'Ishitani Tail Upper Frequency',
-                   'Ishitani Mid Upper Frequency']
-
-        for column in columns:
-            self.df[column] = np.nan
-
-        self.df['Ishitani Ordered'] = False
-        focused = self.df[self.df['Labeled Offset'] == 0]
-
-        for current, group in focused.groupby('Current'):
-            freq = np.asarray(BeamPlotter.mean_array(group['Frequency'])[0], dtype=float)
-            mags = np.asarray(BeamPlotter.mean_array(group['Amplitude'])[0], dtype=float)
-            
-            grads = np.gradient(np.gradient(mags, freq), freq)
-            cand = self.window_peaks(grads)                         
-            idx = np.sort(cand[np.argsort(grads[cand])[-3:]]) 
-
-            if mags[0] == mags[idx][0] or mags[idx][0] < size:
-                idx = idx[1:]
-
-            else:
-                idx = idx[:2]
-
-            print(idx)
-
-            with pm.Model():
-                A1 = pm.HalfNormal('A1', sigma=mags[0])
-                A2 = pm.HalfNormal('A2', sigma=mags[idx][0])
-                A3 = pm.HalfNormal('A3', sigma=mags[idx][1])
-
-                s3 = pm.HalfNormal('s3', sigma=self.empirical_sigma(freq, mags, idx[1], len(mags) - 1))
-                s2 = pm.Deterministic('s2', s3 + pm.HalfNormal('d2', 
-                                       sigma=self.empirical_sigma(freq, mags, idx[0], idx[1])))
-                s1 = pm.Deterministic('s1', s2 + pm.HalfNormal('d1', 
-                                         sigma=self.empirical_sigma(freq, mags, 0, idx[0])))
-
-                sigma = pm.HalfNormal('sigma', sigma = 1.0) 
-
-                model = (A1 * pt.exp(-np.pi**2 * freq**2 * s1**2) +
-                        A2 * pt.exp(-np.pi**2 * freq**2 * s2**2) +
-                        A3 * pt.exp(-np.pi**2 * freq**2 * s3**2))
-                 
-                pm.LogNormal('obs', mu=pt.log(model), sigma=sigma, observed=mags)
-
-                idata = pm.sample(draws=self.draws, tune=self.tune, chains=self.chains,
-                                  target_accept=0.9, random_seed=self.seed)
-
-            post = idata.posterior.median(('chain', 'draw'))
-            A1, s1, A2, s2, A3, s3 = [float(post[k]) for k in ['A1', 's1', 'A2', 's2', 'A3', 's3']]
-            tail_upper = self.gaussian_intersection(A2, s2, A1, s1)
-            mid_upper = self.gaussian_intersection(A3, s3, A2, s2)
-
-            mask = self.df['Current'] == current
-            self.df.loc[mask, 'Ishitani Tail A'] = A1
-            self.df.loc[mask, 'Ishitani Tail Sigma'] = s1
-            self.df.loc[mask, 'Ishitani Mid A'] = A2
-            self.df.loc[mask, 'Ishitani Mid Sigma'] = s2
-            self.df.loc[mask, 'Ishitani Core A'] = A3
-            self.df.loc[mask, 'Ishitani Core Sigma'] = s3
-            self.df.loc[mask, 'Ishitani Tail Upper Frequency'] = tail_upper
-            self.df.loc[mask, 'Ishitani Mid Upper Frequency'] = mid_upper
-            self.df.loc[mask, 'Ishitani Ordered'] = bool(tail_upper < mid_upper)
-
-        return self.df
-
-class RegionalShift:
-    @staticmethod
-    def empirical_sigma(freq, mags, upper, lower):
-        half_max = (mags[upper] - mags[lower]) / 2
-        half_max_idx = np.argmin(np.abs(mags - half_max))
-
-        fwhm = 2 * (freq[half_max_idx] - freq[upper])   # multiply by 2 to account for Gaussian < 0 
-
-        return 0.375 / max(fwhm, 1e-9)        
+        amp, freq,  energy, bin_counts, amp_raw, energy_raw, freq_raw = self.beam_profiles()
+        return amp, freq, energy, bin_counts, amp_raw, energy_raw, freq_raw
     
-    @staticmethod
-    def window_peaks(grads, size=size):
-        return np.array([s + np.argmax(grads[s:s + size]) for s in range(0, len(grads), size)])
+class SampNorm():
+    def __init__(self, im, metadata):
+        self.im = im
+        self.metadata = metadata
+        self.df = metadata.copy()
 
-    def __init__(self, metadata_df, draws=1000, tune=1000, chains=4, seed=0):
-        self.df = metadata_df.copy() 
-        self.draws = draws
-        self.tune = tune
-        self.chains = chains
-        self.seed = seed
-        self.idata = {}     
+    def SampleNormalized(self):
+        self.df['Sample Normalized Amplitude'] = None
+        self.df['Sample Normalized Energy'] = None
+        
+        for (sample, file, current), group in self.df.groupby(['Sample', 'File', 'Current']):
+            focused_row = group[group['Labeled Offset'] == 0].iloc[0]
+            focused_freq = np.asarray(focused_row['Frequency'], dtype=float).ravel()
+            focused_amp = np.asarray(focused_row['Amplitude'], dtype=float).ravel()
+            focused_e = np.asarray(focused_row['Energy'], dtype=float).ravel()
+
+            for idx, row in group.iterrows():
+                freq = np.asarray(row['Frequency'], dtype=float).ravel()
+                amp = np.asarray(row['Amplitude'], dtype=float).ravel()
+                e = np.asarray(row['Energy'], dtype=float).ravel()
+
+                amp_ratio = amp / np.interp(freq, focused_freq, focused_amp, left=np.nan, right=np.nan) 
+                e_ratio = e / np.interp(freq, focused_freq, focused_e, left=np.nan, right=np.nan)
+
+                self.df.at[idx, 'Sample Normalized Amplitude'] = amp_ratio.tolist()
+                self.df.at[idx, 'Sample Normalized Energy'] = e_ratio.tolist()
+
+        return self.df
 
     def run(self):
-        for col in ['A1', 'A2', 'A3', 's1', 's2', 's3']:
-            self.df[col] = np.nan
-
-        focus_amps = {}
-        ordered = self.df.sort_values('Labeled Offset', key=lambda s: s != 0)
-
-        for row_id, row in ordered.iterrows():
-            key = (row['Sample'], row['File'], row['Current'])
-            fixed = None if row['Labeled Offset'] == 0 else focus_amps.get(key)
-
-            freq = np.asarray(row['Frequency'], dtype=float)
-            mags = np.asarray(row['Amplitude'], dtype=float)
-
-            grads = np.gradient(np.gradient(mags, freq), freq)
-            cand = self.window_peaks(grads)                         
-            idx = np.sort(cand[np.argsort(grads[cand])[-3:]]) 
-
-            if mags[0] == mags[idx][0] or mags[idx][0] < size:
-                idx = idx[1:]
-            
-            else:
-                idx = idx[:2]
-        
-            with pm.Model():
-                if fixed is None:
-                    A1 = pm.HalfNormal('A1', sigma=mags[0])
-                    A2 = pm.HalfNormal('A2', sigma=mags[idx][0])
-                    A3 = pm.HalfNormal('A3', sigma=mags[idx][1])
-                else:
-                    A1, A2, A3 = fixed
-
-                s3 = pm.HalfNormal('s3', sigma=self.empirical_sigma(freq, mags, idx[1], len(mags) - 1))
-                s2 = pm.Deterministic('s2', s3 + pm.HalfNormal('d2', 
-                                        sigma=self.empirical_sigma(freq, mags, idx[0], idx[1])))
-                s1 = pm.Deterministic('s1', s2 + pm.HalfNormal('d1', 
-                    sigma=self.empirical_sigma(freq, mags, 0, idx[0])))
-
-                sigma = pm.HalfNormal('sigma', sigma=1.0)
-
-                terms = pt.stack([
-                    pt.log(A1) - np.pi**2 * freq**2 * s1**2,
-                    pt.log(A2) - np.pi**2 * freq**2 * s2**2,
-                    pt.log(A3) - np.pi**2 * freq**2 * s3**2])
-
-                pm.LogNormal('obs', mu=pt.logsumexp(terms, axis=0), sigma=sigma, observed=mags)
-
-                idata = pm.sample(draws=self.draws, tune=self.tune, chains=self.chains,
-                                  target_accept=0.9, random_seed=self.seed)
-
-            post = idata.posterior.median(('chain', 'draw'))
-            s1, s2, s3 = [float(post[k]) for k in ['s1', 's2', 's3']]
-            if fixed is None:
-                A1, A2, A3 = [float(post[k]) for k in ['A1', 'A2', 'A3']]
-            if row['Labeled Offset'] == 0:
-                focus_amps[key] = (A1, A2, A3)
-
-            for k, v in zip(['A1', 's1', 'A2', 's2', 'A3', 's3'], [A1, s1, A2, s2, A3, s3]):
-                self.df.loc[row_id, k] = v
-
-        self.df['Sum A'] = self.df[['s1', 's2', 's2']].sum(axis=1)
-        self.df['Tail Frac'] = self.df['s1'] / self.df['Sum A']
-        self.df['Mid Frac']  = self.df['s2'] / self.df['Sum A']
-        self.df['Core Frac'] = self.df['s3'] / self.df['Sum A']
-
-        keys = ['Sample', 'File', 'Current']
-        fracs = ['Tail Frac', 'Mid Frac', 'Core Frac']
-        focused = (self.df[self.df['Labeled Offset'] == 0].drop_duplicates(subset=keys)
-                .set_index(keys)[fracs].add_suffix(' Focus'))
-        self.df = self.df.join(focused, on=keys)
-
-        for name in ['Tail', 'Mid', 'Core']:
-            self.df[f'{name} Amplitude Change'] = 100 * (self.df[f'{name} Frac'] - self.df[f'{name} Frac Focus'])
-
+        self.df = self.SampleNormalized()
         return self.df
 
 class BeamPlotter:
@@ -397,35 +177,11 @@ class BeamPlotter:
         self.output_path = output_path
 
     @staticmethod
-    def normalize(df, cols):
-        df = df.copy()
-        for col in cols:
-            for current, idx in df.groupby('Current').groups.items():
-                group_max = max(np.max(a) for a in df.loc[idx, col])
-                df.loc[idx, col] = df.loc[idx, col].apply(
-                    lambda a: (np.asarray(a, dtype=float) / group_max).tolist())
-        return df
-
-    @staticmethod
-    def mean_array(s):
-        n = min(len(a) for a in s)
-        return [np.mean([a[:n] for a in s], axis=0).tolist()] * len(s)
-
-    @staticmethod
-    def ishitani_curve(f, A1, s1, A2, s2, A3, s3):
-        f = np.asarray(f, dtype=float)
-        return sum(A * np.exp(-np.pi**2 * f**2 * s**2)
-               for A, s in [(A1, s1), (A2, s2), (A3, s3)])
-
-    @staticmethod
-    def profile_plot(freq, amp, sample, current, ylabel='Normalized Signal', 
-                     xlabel='Spatial Frequency (cycles/µm)', title='Mean Radial Profile',
+    def profile_plot(freq, amp, sample, current, ylabel='',  xlabel='Spatial Frequency (cycles/µm)', title='',
                      palette='cool'):
         freq, amp = np.asarray(freq), np.asarray(amp)
         hue = np.broadcast_to(sample, freq.shape)
-        dashes = {s: (1, 1) if s == 'All Data Mean' else '' for s in np.unique(hue)}
-        pp = sns.relplot(kind = 'line', x = freq, y = amp, palette = palette, hue = hue, 
-                         style = hue, dashes = dashes, 
+        pp = sns.relplot(kind = 'line', x = freq, y = amp, palette = palette, hue = hue, errorbar = None,
                          col = np.broadcast_to(np.asarray(current,dtype = float), freq.shape))
         pp.set_xlabels('')
         pp.set_ylabels(ylabel)
@@ -435,135 +191,23 @@ class BeamPlotter:
         plt.suptitle(title, x=0.5, y=0.99, ha='center')
         return pp
 
-    def plot_sample_profiles(self, first_rows, average_rows, total_rows):
-        plot_data = (pd.concat([first_rows, average_rows, total_rows])[['Sample', 'Current', 'Labeled Offset', 
-                    'Frequency', 'Amplitude']].explode(['Frequency', 'Amplitude']).astype({'Frequency': float, 'Amplitude': float}))
+    def plot_means(self, freq_col, val_col, ylabel, title, filename, drop_focus=False, log=True):
+        rows = []
+        for (current, offset), g in self.df.groupby(['Current', 'Labeled Offset']):
+            f, v = mean_profile(g, freq_col, val_col)
+            rows.append(pd.DataFrame({'Current': current, 'Labeled Offset': offset, freq_col: f, val_col: v}))
+        d = pd.concat(rows)
+        if drop_focus:
+            d = d[d['Labeled Offset'] != 0]
 
-        for offset in sorted(plot_data['Labeled Offset'].unique()):
-            d = plot_data[plot_data['Labeled Offset'] == offset]
-            pp = self.profile_plot(freq=d['Frequency'], amp=d['Amplitude'], 
-                                   sample=d['Sample'], current=d['Current'], 
-                                   ylabel='Mean Magnitude per Frequency Bin', xlabel='Spatial Frequency (cycles/µm)',
-                                   title=f'Beam Profile at {offset} V Defocus Offset')
+        pp = self.profile_plot(freq=d[freq_col], amp=d[val_col],
+                           sample=d['Labeled Offset'].astype(str), current=d['Current'],
+                           ylabel=ylabel, title=title)
+        if log:
             pp.set(yscale='log')
-            pp.savefig(self.output_path + '/Profiles_' + str(offset) + 'V.jpeg', bbox_inches='tight')
-            plt.close(pp.figure)
 
-    def plot_mean_frequency_profiles(self, total_rows, offset_order):
-        d = total_rows.copy()
-        d['Labeled Offset'] = pd.Categorical(d['Labeled Offset'], categories=offset_order, ordered=True)
-        d = d.sort_values(['Current', 'Labeled Offset'])
-        d = (d[['Current', 'Labeled Offset', 'Frequency', 'Amplitude']].explode(['Frequency', 'Amplitude'])
-             .astype({'Frequency': float, 'Amplitude': float}))
-
-        pp = self.profile_plot(freq=d['Frequency'], amp=d['Amplitude'], 
-                                sample=d['Labeled Offset'].astype(str), current=d['Current'], 
-                                ylabel='Mean Magnitude per Frequency Bin', xlabel='Spatial Frequency (cycles/µm)',
-                                title='Mean Spatial Frequency Profiles')
-        pp.set(yscale='log')
-        pp.savefig(self.output_path + '/Mean_Frequency_Profiles.jpeg', bbox_inches='tight')
+        pp.savefig(self.output_path + filename, bbox_inches='tight')
         plt.close(pp.figure)
-
-    def plot_mean_spatial_energy(self, total_rows, offset_order):
-        d = total_rows.copy()
-        d['Labeled Offset'] = pd.Categorical(d['Labeled Offset'], categories=offset_order, ordered=True)
-        d = d.sort_values(['Current', 'Labeled Offset'])
-
-        plot_freq, plot_energy, plot_offset, plot_current = [], [], [], []
-        for _, row in d.iterrows():
-            freq = np.asarray(row['Energy Frequency'], dtype=float)
-            energy = np.asarray(row['Energy'], dtype=float)
-
-            plot_freq.extend(freq)
-            plot_energy.extend(energy)
-            plot_offset.extend([str(row['Labeled Offset'])] * len(freq))
-            plot_current.extend([row['Current']] * len(freq))
-
-        d_plot = pd.DataFrame({'Current': plot_current, 'Labeled Offset': plot_offset, 'Energy Frequency': plot_freq, 'Energy': plot_energy})
-        d_plot['Labeled Offset'] = pd.Categorical(d_plot['Labeled Offset'], categories=[str(x) for x in offset_order], ordered=True)
-
-        pp = self.profile_plot(freq=d_plot['Energy Frequency'], 
-                               amp=d_plot['Energy'], 
-                               sample=d_plot['Labeled Offset'], current=d_plot['Current'], 
-                               ylabel='Mean Magnitude Squared per Frequency Bin',
-                               xlabel='Spatial Frequency (cycles/µm)', 
-                               title='Mean Power Profiles')
-        pp.set(yscale='log')
-        pp.savefig(self.output_path + '/Mean_Spatial_Energy.jpeg', bbox_inches='tight')
-        plt.close(pp.figure)
-
-    def plot_mean_sample_norm_amp(self, total_rows, offset_order):
-        d = total_rows.copy()
-        d['Labeled Offset'] = pd.Categorical(d['Labeled Offset'], categories=offset_order, ordered=True)
-        d = d.sort_values(['Current', 'Labeled Offset'])
-
-        plot_freq, plot_amp, plot_offset, plot_current = [], [], [], []
-
-        for _, row in d.iterrows():
-            freq = np.asarray(row['Frequency'], dtype=float)
-            amp = np.asarray(row['Sample Normalized Amplitude'], dtype=float)
-
-            plot_freq.extend(freq)
-            plot_amp.extend(amp)
-            plot_offset.extend([str(row['Labeled Offset'])] * len(freq))
-            plot_current.extend([row['Current']] * len(freq))
-
-        d_plot = pd.DataFrame({'Current': plot_current, 'Labeled Offset': plot_offset, 
-                               'Frequency': plot_freq, 'Amplitude': plot_amp})
-        d_plot['Labeled Offset'] = pd.Categorical(d_plot['Labeled Offset'], 
-                                    categories=[str(x) for x in offset_order], ordered=True)
-
-        pp = self.profile_plot(freq=d_plot['Frequency'], amp=d_plot['Amplitude'], 
-                                sample=d_plot['Labeled Offset'], current=d_plot['Current'], 
-                                ylabel='Mean Magnitude per Frequency Bin', xlabel='Spatial Frequency (cycles/µm)', 
-                                title='Mean Sample Normalized Frequency Magnitude')
-        pp.set(yscale='log')
-        pp.savefig(self.output_path + '/Mean_samp_norm_amp.jpeg', bbox_inches='tight')
-        plt.close(pp.figure)
-
-    def plot_mean_sample_norm_energy(self, total_rows, offset_order):
-            d = total_rows.copy()
-            d['Labeled Offset'] = pd.Categorical(d['Labeled Offset'], categories=offset_order, ordered=True)
-            d = d.sort_values(['Current', 'Labeled Offset'])
-    
-            plot_freq, plot_energy, plot_offset, plot_current = [], [], [], []
-    
-            for _, row in d.iterrows():
-                freq = np.asarray(row['Energy Frequency'], dtype=float)
-                energy = np.asarray(row['Sample Normalized Energy'], dtype=float)
-    
-                plot_freq.extend(freq)
-                plot_energy.extend(energy)
-                plot_offset.extend([str(row['Labeled Offset'])] * len(freq))
-                plot_current.extend([row['Current']] * len(freq))
-    
-            d_plot = pd.DataFrame({'Current': plot_current, 'Labeled Offset': plot_offset, 
-                                   'Energy Frequency': plot_freq, 'Energy': plot_energy})
-            d_plot['Labeled Offset'] = pd.Categorical(d_plot['Labeled Offset'], 
-                                        categories=[str(x) for x in offset_order], ordered=True)
-    
-            pp = self.profile_plot(freq=d_plot['Energy Frequency'], amp=d_plot['Energy'], 
-                                    sample=d_plot['Labeled Offset'], current=d_plot['Current'], 
-                                    ylabel='Mean Magnitude Squared per Frequency Bin', xlabel='Spatial Frequency (cycles/µm)', 
-                                    title='Mean Sample Normalized Power')
-            bounds = {float(r['Current']): (r['Ishitani Tail Upper Frequency'],
-                                            r['Ishitani Mid Upper Frequency'])
-                      for _, r in d.drop_duplicates(subset='Current').iterrows()}
-
-            for current, ax in pp.axes_dict.items():
-                tail_upper, mid_upper = bounds[current]
-                ax.axvline(tail_upper, linestyle=':', color='black')
-                ax.axvline(mid_upper, linestyle='--', color='black')
-
-            legend_data = {t.get_text(): h for t, h in zip(pp._legend.get_texts(), pp._legend.legend_handles)}
-            legend_data['Tail Upper Bound'] = Line2D([], [], linestyle=':', color='black')
-            legend_data['Mid Upper Bound'] = Line2D([], [], linestyle='--', color='black')
-            pp._legend.remove()
-            pp.add_legend(legend_data=legend_data)
-
-            pp.set(yscale='log')
-            pp.savefig(self.output_path + '/Mean_samp_norm_energy.jpeg', bbox_inches='tight')
-            plt.close(pp.figure)
 
     def plot_sample_norm_amp_profiles(self, offset_order, n_samples, random_state=None):
         rng = np.random.default_rng(random_state)
@@ -577,9 +221,6 @@ class BeamPlotter:
             plot_freq, plot_amp, plot_offset, plot_current, plot_trace_id = [], [], [], [], []
 
             for idx, row in file_data.iterrows():
-                if not isinstance(row['Sample Normalized Amplitude'], list) or len(row['Sample Normalized Amplitude']) == 0:
-                    continue
-
                 freq = np.asarray(row['Frequency'], dtype=float)
                 amp = np.asarray(row['Sample Normalized Amplitude'], dtype=float)
 
@@ -623,9 +264,6 @@ class BeamPlotter:
             plot_freq, plot_energy, plot_offset, plot_current, plot_trace_id = [], [], [], [], []
 
             for idx, row in file_data.iterrows():
-                if not isinstance(row['Sample Normalized Energy'], list) or len(row['Sample Normalized Energy']) == 0:
-                    continue
-
                 freq = np.asarray(row['Energy Frequency'], dtype=float)
                 energy = np.asarray(row['Sample Normalized Energy'], dtype=float)
 
@@ -644,179 +282,35 @@ class BeamPlotter:
                 categories=offset_order, ordered=True)
 
             pp = sns.relplot(data=plot_data, kind='line', x='Energy Frequency', y='Sample Normalized Energy', 
-                                hue='Labeled Offset', units='Trace_ID', estimator=None, 
-                                col='Current', palette='cool', alpha=0.85, linewidth=1.2)
+                             hue='Labeled Offset', units='Trace_ID', estimator=None, 
+                             col='Current', palette='cool', alpha=0.85, linewidth=1.2)
 
             pp.set_xlabels('Spatial Frequency (cycles/µm)')
             pp.set_ylabels('Mean Magnitude Squared per Frequency Bin')
             pp.set_titles('Current = {col_name}')
             pp.figure.subplots_adjust(top=0.84)
-            pp.figure.suptitle('Sample Normalized Power ' + sample_name + 'File: ' + file_id)
+            pp.figure.suptitle('Sample Normalized Power ' + sample_name + ' File: ' + file_id)
             pp.set(yscale='log')
             pp.savefig(self.output_path + '/SampNormEnergy_' + sample_name + '_' + file_id + '.jpeg', 
-                        bbox_inches='tight')
+                       bbox_inches='tight')
             plt.close(pp.figure)
 
-    def plot_mean_sample_norm_energydiff(self, total_rows, offset_order):
-        d = total_rows.copy()
-        d['Labeled Offset'] = pd.Categorical(d['Labeled Offset'], categories=offset_order, ordered=True)
-        d = d.sort_values(['Current', 'Labeled Offset'])
-
-        plot_freq, plot_energy, plot_offset, plot_current = [], [], [], []
-
-        for _, row in d.iterrows():
-            freq = np.asarray(row['Energy Frequency'], dtype=float)
-            energy = np.asarray(row['Percent Energy Lost'], dtype=float)
-
-            plot_freq.extend(freq)
-            plot_energy.extend(energy)
-            plot_offset.extend([str(row['Labeled Offset'])] * len(freq))
-            plot_current.extend([row['Current']] * len(freq))
-
-        d_plot = pd.DataFrame({'Current': plot_current, 'Labeled Offset': plot_offset, 
-                                'Energy Frequency': plot_freq, 'Percent Energy Lost': plot_energy})
-        d_plot['Labeled Offset'] = pd.Categorical(d_plot['Labeled Offset'], 
-                                    categories=[str(x) for x in offset_order], ordered=True)
-
-        pp = self.profile_plot(freq=d_plot['Energy Frequency'], amp=d_plot['Percent Energy Lost'], 
-                                sample=d_plot['Labeled Offset'], current=d_plot['Current'], 
-                                ylabel=f'% Power Lost', xlabel='Spatial Frequency (cycles/µm)', 
-                                title='Mean Percent Power Lost per Frequency')
-        # pp.set(yscale='log')
-        pp.savefig(self.output_path + '/Mean_samp_norm_energydiff.jpeg', bbox_inches='tight')
-        plt.close(pp.figure)
-
-    def ishitani_fits(self):
-        focused = self.df[self.df['Labeled Offset'] == 0].dropna(subset=['Ishitani Core A'])
-        focused = focused.drop_duplicates(subset='Current')
-
-        plot_freq, plot_amp, plot_label, plot_current = [], [], [], []
-        bounds = {}
-        for _, row in focused.iterrows():
-            freq = np.asarray(row['Mean Frequency'], dtype=float)
-            amp = np.asarray(row['Mean Amplitude'], dtype=float)
-            fit = self.ishitani_curve(freq,
-                          row['Ishitani Tail A'], row['Ishitani Tail Sigma'],
-                          row['Ishitani Mid A'], row['Ishitani Mid Sigma'],
-                          row['Ishitani Core A'], row['Ishitani Core Sigma'])
-            
-            for label, y in [('Empirical', amp), ('Ishitani Fit', fit)]:
-                plot_freq.extend(freq)
-                plot_amp.extend(y)
-                plot_label.extend([label] * len(freq))
-                plot_current.extend([row['Current']] * len(freq))
-
-            bounds[float(row['Current'])] = (row['Ishitani Tail Upper Frequency'],
-                                             row['Ishitani Mid Upper Frequency'])
-
-        pp = self.profile_plot(freq=plot_freq, amp=plot_amp,
-                               sample=np.array(plot_label), current=plot_current,
-                               ylabel='Mean Magnitude per Frequency Bin',
-                               xlabel='Spatial Frequency (cycles/µm)',
-                               title='Ishitani Regions in Frequency Space', 
-                               palette={'Empirical': 'mediumslateblue', 'Ishitani Fit': 'lawngreen'})
-        pp.set(yscale='log')
-
-        for current, ax in pp.axes_dict.items():
-            tail_upper, mid_upper = bounds[current]
-            ax.axvline(tail_upper, linestyle=':', color='black')
-            ax.axvline(mid_upper, linestyle='--', color='black')
-
-        legend_data = {t.get_text(): h for t, h in zip(pp._legend.get_texts(), pp._legend.legend_handles)}
-        legend_data['Tail Upper Bound'] = Line2D([], [], linestyle=':', color='black')
-        legend_data['Mid Upper Bound'] = Line2D([], [], linestyle='--', color='black')
-        pp._legend.remove()
-        pp.add_legend(legend_data=legend_data)
-
-        pp.savefig(self.output_path + '/Ishitani_fits.jpeg', bbox_inches='tight')
-        plt.close(pp.figure)
-
-    def redistribution_with_defocus(self):
-        ids = ['Current', 'Labeled Offset', 'File']
-        d_all = self.df.copy()
-
-        def melt(cols, value_name):
-            d = d_all.melt(id_vars=ids, value_vars=cols, var_name='Region', value_name=value_name)
-            d['Region'] = d['Region'].str.split(' ').str[0]
-            return d
-
-        shifts = melt(['Tail Amplitude Change', 'Mid Amplitude Change', 'Core Amplitude Change'],
-                    'Amplitude Change')
-        
-        pp = sns.relplot(data=shifts, kind='line', x='Labeled Offset', y='Amplitude Change',
-                        hue='Region', col='Current', estimator='mean', errorbar='sd',
-                        marker='o', palette='cool')
-        for ax in pp.axes.flat:
-            ax.axhline(0, linestyle='--', color='black')
-        pp.set_xlabels('')
-        pp.figure.text(0.5, 0.02, 'Defocus Offset (V)', ha='center', va='center')
-        pp.set_titles('Current = {col_name}')
-        pp.figure.subplots_adjust(top=0.84)
-        pp.figure.suptitle('Percent Ishitiani Fit Amplitude Change from Focus')
-        pp.savefig(self.output_path + '/Ishitani_fraction_shifts.jpeg', bbox_inches='tight')
-        plt.close(pp.figure)
-
     def run(self):
-        groups = self.df.groupby(['Current', 'Labeled Offset'])
-        self.df['Mean Frequency'] = groups['Frequency'].transform(self.mean_array)
-        self.df['Mean Amplitude'] = groups['Amplitude'].transform(self.mean_array)
-        self.df['Mean Energy'] = groups['Energy'].transform(self.mean_array)
-        self.df['Mean Sample Normalized Amplitude'] = groups['Sample Normalized Amplitude'].transform(self.mean_array)
-        self.df['Mean Sample Normalized Energy'] = groups['Sample Normalized Energy'].transform(self.mean_array)
-        self.df['Mean Energy Frequency'] = groups['Energy Frequency'].transform(self.mean_array)
-        self.df['Mean Percent Energy Lost'] = groups['Percent Energy Lost'].transform(self.mean_array)
-        
-        offset_order = sorted(self.df['Labeled Offset'].dropna().unique())
+        self.plot_means('Frequency', 'Amplitude', 'Magnitude',
+                        'Mean Spatial Frequency Distribution', '/Mean_Frequency_Profiles.jpeg')
+        self.plot_means('Energy Frequency', 'Energy', 'Power',
+                        'Mean Power Distribution', '/Mean_Spatial_Energy.jpeg')
+        self.plot_means('Frequency', 'Sample Normalized Amplitude', r'$\tilde{K}(f)$',
+                        'Mean Sample Normalized Frequency Magnitude', '/Mean_samp_norm_amp.jpeg', drop_focus=True)
+        self.plot_means('Energy Frequency', 'Sample Normalized Energy', r'$\tilde{K}(f)$',
+                        'Mean Sample Normalized Power', '/Mean_samp_norm_energy.jpeg', drop_focus=True)
 
-        first_rows = self.df.drop_duplicates(subset=['Sample', 'Current', 'Labeled Offset']).copy()
-
-        subset_groups = first_rows.groupby(['Current', 'Labeled Offset'])
-        first_rows['Subset Mean Frequency'] = subset_groups['Frequency'].transform(self.mean_array)
-        first_rows['Subset Mean Amplitude'] = subset_groups['Amplitude'].transform(self.mean_array)
-        first_rows['Subset Mean Energy'] = subset_groups['Energy'].transform(self.mean_array)
-        first_rows['Subset Mean Sample Normalized Amplitude'] = subset_groups['Sample Normalized Amplitude'].transform(self.mean_array)
-        first_rows['Subset Mean Sample Normalized Energy'] = subset_groups['Sample Normalized Energy'].transform(self.mean_array)
-        first_rows['Subset Mean Percent Energy Lost'] = subset_groups['Percent Energy Lost'].transform(self.mean_array)
-
-
-        average_rows = first_rows.drop_duplicates(subset=['Current', 'Labeled Offset']).copy()
-        average_rows['Sample'] = 'Average'
-        average_rows['Frequency'] = average_rows['Subset Mean Frequency']
-        average_rows['Amplitude'] = average_rows['Subset Mean Amplitude']
-        average_rows['Energy'] = average_rows['Subset Mean Energy']
-        average_rows['Sample Normalized Amplitude'] = average_rows['Subset Mean Sample Normalized Amplitude']
-        average_rows['Sample Normalized Energy'] = average_rows['Subset Mean Sample Normalized Energy']
-        average_rows['Percent Energy Lost'] = average_rows['Subset Mean Percent Energy Lost']
-
-        total_rows = first_rows.drop_duplicates(subset=['Current', 'Labeled Offset']).copy()
-        total_rows['Sample'] = 'All data average'
-        total_rows['Frequency'] = total_rows['Mean Frequency']
-        total_rows['Amplitude'] = total_rows['Mean Amplitude']
-        total_rows['Sample Normalized Amplitude'] = total_rows['Mean Sample Normalized Amplitude']
-        total_rows['Sample Normalized Energy'] = total_rows['Mean Sample Normalized Energy']
-        total_rows['Percent Energy Lost'] = total_rows['Mean Percent Energy Lost']
-        total_rows['Energy'] = total_rows['Mean Energy']
-        total_rows['Energy Frequency'] = total_rows['Mean Energy Frequency']
-        
-        # plot
-        # first_rows   = self.normalize(first_rows,   ['Amplitude', 'Energy'])
-        # average_rows = self.normalize(average_rows, ['Amplitude', 'Energy'])
-        # total_rows   = self.normalize(total_rows,   ['Amplitude', 'Energy'])
-
-        # self.plot_sample_profiles(first_rows, average_rows, total_rows)
-        # self.plot_mean_frequency_profiles(total_rows, offset_order)
-        # self.plot_mean_spatial_energy(total_rows, offset_order)
-        # self.plot_mean_sample_norm_amp(total_rows, offset_order)
+        # offset_order = sorted(self.df['Labeled Offset'].dropna().unique())
         # self.plot_sample_norm_amp_profiles(offset_order, n_samples=3)
-        self.plot_mean_sample_norm_energy(total_rows, offset_order)
         # self.plot_sample_norm_energy_profiles(offset_order, n_samples=3)
-        # self.plot_mean_sample_norm_energydiff(total_rows, offset_order)
-        self.ishitani_fits()
-        self.redistribution_with_defocus()
 
 ##### main execution block #####
 meta = []
-debug_results = []
 for folder in os.listdir(path + inputs):
     if '.DS_Store' in folder:
         continue
@@ -837,39 +331,30 @@ for folder in os.listdir(path + inputs):
                 metadata, im, im_fft = PrepareImages(image_path, file, sample).run()
 
                 # calculate beam profile and spatial energy stats
-                (amp, freq, energy, freq_energy, bin_counts) = BeamStats(im, metadata.iloc[0]).run()
-    
+                amp, freq, energy, bin_counts, amp_raw, energy_raw, freq_raw = BeamStats(im, metadata.iloc[0]).run()
+
                 metadata['Amplitude'] = [amp.tolist()]
                 metadata['Frequency'] = [freq.tolist()]
                 metadata['Energy'] = [energy.tolist()]
-                metadata['Energy Frequency'] = [freq_energy.tolist()]
+                metadata['Energy Frequency'] = [freq.tolist()]
                 metadata['Energy Bin Counts'] = [bin_counts.tolist()]
+                # metadata['Amplitdude Raw'] = [amp_raw.tolist()]
+                # metadata['Energy Raw'] = [energy_raw.tolist()]
+                # metadata['Frequency Raw'] = [freq_raw.tolist()]
                 meta.append(metadata)
 
+                '''
                 # save FFT per image
                 cv2.imwrite(path + outputs + '/' + sample + '/' + file + '/' + image_name + '.jpeg', 
                             cv2.normalize(im, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+                '''
 
 ##### aggregate metadata #####
 all_metadata = pd.concat(meta, ignore_index=True)
 
-##### compute sample normalized profiles #####
-print('Calculating sample-normalized mean radially binned frequency magnitudes.')
-normalizer = SampleNormalizedAmplitude(metadata_df=all_metadata)
-all_metadata = normalizer.run()
-
-energy_normalizer = SampleNormalizedEnergy(metadata_df=all_metadata)
-all_metadata = energy_normalizer.run()
-
-##### calculate Ishitani beam regions in frequency space #####
-print('Finding Ishitani frequency regions.')
-ishitani = IshitaniFit(metadata_df=all_metadata)
-all_metadata = ishitani.run()
-
-##### compare Ishitani amplitudes #####
-print('Calculating regional beam changes by defocus offset.')
-regional = RegionalShift(all_metadata)
-all_metadata = regional.run()
+##### sasmple normalizing #####
+print('Sample normalizing.')
+all_metadata = SampNorm(None, all_metadata).run()
 
 ##### save metadata #####
 all_metadata.to_csv(path + outputs + '/all_meta_data.csv', index=False)
