@@ -261,21 +261,34 @@ class SampNorm():
 
         return self.df
 
-    def fit_Kf(self, fmax=1.0):
-        self.df['K Fit Params'] = None
+    # def fit_Kf(self, fmax=1.0):
+    #     self.df['K Fit Params'] = None
 
-        def linear(x, m, b):
-            return m * x + b
+    #     def linear(x, m, b):
+    #         return m * x + b
 
-        d = self.df[self.df['Labeled Offset'] != 0]
-        for _, g in d.groupby(['Sample', 'Current', 'Labeled Offset']):
-            f = np.asarray(g.iloc[0]['Frequency'], dtype=float)
-            K = np.mean(np.stack(g['Sample Normalized Energy']), axis=0)
-            ok = f <= fmax
+    #     d = self.df[self.df['Labeled Offset'] != 0]
+    #     for _, g in d.groupby(['Sample', 'Current', 'Labeled Offset']):
+    #         f = np.asarray(g.iloc[0]['Frequency'], dtype=float)
+    #         K = np.mean(np.stack(g['Sample Normalized Energy']), axis=0)
+    #         ok = f <= fmax
 
-            popt, _ = curve_fit(linear, f[ok], K[ok], p0=[-0.1, K[0]], bounds=((-1, K.min()), (0, 2 * K.max())))
-            for idx in g.index:
-                self.df.at[idx, 'K Fit Params'] = popt.tolist()
+    #         popt, _ = curve_fit(linear, f[ok], K[ok], p0=[-0.1, K[0]], bounds=((-1, K.min()), (0, 2 * K.max())))
+    #         for idx in g.index:
+    #             self.df.at[idx, 'K Fit Params'] = popt.tolist()
+
+    # def fit_Kf(self, fmax=1.0):
+    #     self.df['K Fit Params'] = None
+
+    #     d = self.df[self.df['Labeled Offset'] != 0]
+    #     for _, g in d.groupby(['Sample', 'Current', 'Labeled Offset']):
+    #         f = np.asarray(g.iloc[0]['Frequency'], dtype=float)
+    #         K = np.mean(np.stack(g['Sample Normalized Energy']), axis=0)
+    #         ok = f <= fmax
+
+    #         popt, _ = curve_fit(gauss, f[ok], K[ok], p0=[K[0], 1.], bounds=((0, f.min()), (2 * K.max(), 2 * f.max())))
+    #         for idx in g.index:
+    #             self.df.at[idx, 'K Fit Params'] = popt.tolist()
 
     def run(self):
         self.df = self.SampleNormalized()
@@ -504,6 +517,7 @@ class BeamPlotter:
             m, b = g.iloc[0]['K Fit Params']
 
             ax.plot(f, K, label='Mean K(f)', color='indigo')
+            ax.plot(f, gauss(f, m, b), label=f'Fit: m={m:.2f}, b={b:.2f}', color='red', ls='--')
             ax.plot(f, m * f + b, label=f'Fit: m={m:.2f}, b={b:.2f}', color='red', ls='--')
             ax.set_title(f"{sample}\n {current} pA, offset = {offset} V", fontsize=8)
             ax.legend(fontsize=7)
