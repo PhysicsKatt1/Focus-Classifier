@@ -261,38 +261,51 @@ class SampNorm():
 
         return self.df
 
-    # def fit_Kf(self, fmax=1.0):
-    #     self.df['K Fit Params'] = None
+    def fit_Kf(self, fmax=1.5):
+        self.df['K Fit Params'] = None
 
-    #     def linear(x, m, b):
-    #         return m * x + b
+        d = self.df[self.df['Labeled Offset'] != 0]
+        for _, g in d.groupby(['Sample', 'Current', 'Labeled Offset']):
+            f = np.asarray(g.iloc[0]['Frequency'], dtype=float)
+            K = np.mean(np.stack(g['Sample Normalized Energy']), axis=0)
+            ok = (f <= fmax) & np.isfinite(K)
 
-    #     d = self.df[self.df['Labeled Offset'] != 0]
-    #     for _, g in d.groupby(['Sample', 'Current', 'Labeled Offset']):
-    #         f = np.asarray(g.iloc[0]['Frequency'], dtype=float)
-    #         K = np.mean(np.stack(g['Sample Normalized Energy']), axis=0)
-    #         ok = f <= fmax
+            # f0 is the frequency where K has fallen to e^(−1/2) of A, so it measures how wide K is in frequency space.
+            # A strongly blurred image kills high frequencies, so K is narrow and f0 is small. As blur shrinks toward 
+            # zero, K gets wider, so f0 grows and goes to infinity when there is no blur at all. Fitting f0 near 
+            # focus means the optimizer is chasing a parameter that runs off to infinity. Instead, fitting s = 1 /f0^2
+            # lets s -> 0 as f0 -> inf, thereby allowing the optimizer to fit near focus.
+            # We fix the Gaussian amplitude at 1.0 since focus / focus = 1.0 and since K(0) = 1 by convention
+            # and because a common amplitude is required for an apples to apples comparison of how the Gaussian 
+            # std changes with voltage offset. Also, σ_f = FWHM / (2√(2 ln 2)) ≈ FWHM / 2.3548
+            # where σ_f = f0 = 1/√s. Since s = 1/σ_f², the initial guess for s is  s₀ = 8 ln 2 / FWHM².
+            half = K[ok] <= 0.5 * K[ok].max()
+            f_half = f[ok][half][0] if half.any() else f[ok].max()
+            s0 = 8 * np.log(2) / (2 * f_half)**2
+            
+            popt, _ = curve_fit(lambda f, s: 1.0 * np.exp(-s * f**2 / 2), f[ok], K[ok],
+                               p0=[s0], sigma=K[ok], bounds=((0), (np.inf)))
 
-    #         popt, _ = curve_fit(linear, f[ok], K[ok], p0=[-0.1, K[0]], bounds=((-1, K.min()), (0, 2 * K.max())))
-    #         for idx in g.index:
-    #             self.df.at[idx, 'K Fit Params'] = popt.tolist()
+            for idx in g.index:
+                self.df.at[idx, 'K Fit Params'] = popt.tolist()
 
-    # def fit_Kf(self, fmax=1.0):
-    #     self.df['K Fit Params'] = None
+    def fit_s_vs_V(self):
+        self.df['sV Fit Params'] = None
 
-    #     d = self.df[self.df['Labeled Offset'] != 0]
-    #     for _, g in d.groupby(['Sample', 'Current', 'Labeled Offset']):
-    #         f = np.asarray(g.iloc[0]['Frequency'], dtype=float)
-    #         K = np.mean(np.stack(g['Sample Normalized Energy']), axis=0)
-    #         ok = f <= fmax
+        d = self.df.dropna(subset=['K Fit Params']).drop_duplicates(['Sample', 'Current', 'Labeled Offset']).copy()
+        d['s'] = d['K Fit Params'].str[1]
 
-    #         popt, _ = curve_fit(gauss, f[ok], K[ok], p0=[K[0], 1.], bounds=((0, f.min()), (2 * K.max(), 2 * f.max())))
-    #         for idx in g.index:
-    #             self.df.at[idx, 'K Fit Params'] = popt.tolist()
+        for current, g in d.groupby('Current'):
+            m = g.groupby('Labeled Offset')['s'].mean()
+            popt, _ = curve_fit(lambda V, a, b, c: a * V**2 + b * V + c, m.index.values, m.values)
+
+            for idx in self.df.index[self.df['Current'] == current]:
+                self.df.at[idx, 'sV Fit Params'] = popt.tolist()
 
     def run(self):
         self.df = self.SampleNormalized()
         self.fit_Kf()
+        self.fit_s_vs_V()
 
         return self.df
 
@@ -455,7 +468,7 @@ class BeamPlotter:
         plt.savefig(self.output_path + f'/DenoisedSample.jpeg', bbox_inches='tight')
         plt.close(fig) 
 
-    def plot_samples(self, n_samples, random_state=None):
+    def plot_samples(self, n_samples, random_state):
         rng = np.random.default_rng(random_state)
         pairs = self.df[['Sample', 'File']].drop_duplicates()
         pairs = pairs.sample(n=min(n_samples, len(pairs)), random_state=random_state)
@@ -485,12 +498,11 @@ class BeamPlotter:
 
     def plot_K_params(self):
         d = self.df.dropna(subset=['K Fit Params']).drop_duplicates(['Sample', 'Current', 'Labeled Offset']).copy()
-        d['m'] = d['K Fit Params'].str[0]
-        d['b'] = d['K Fit Params'].str[1]
+        d['s'] = d['K Fit Params'].str[1]
 
-        for p in ['m', 'b']:
+        for p in ['s']:
             pp = sns.relplot(data=d, kind='line', x='Labeled Offset', y=p, col='Current',
-                            marker='o', errorbar='sd')
+                            marker='o', errorbar='sd',  palette=['lightblue'])
             pp.set_xlabels('Labeled Offset (V)')
             pp.set_ylabels(p)
             pp.set_titles('Current = {col_name}')
@@ -514,11 +526,10 @@ class BeamPlotter:
             (sample, current, offset), g = groups[i]
             f = np.asarray(g.iloc[0]['Frequency'], dtype=float)
             K = np.mean(np.stack(g['Sample Normalized Energy']), axis=0)
-            m, b = g.iloc[0]['K Fit Params']
+            s = g.iloc[0]['K Fit Params']
 
             ax.plot(f, K, label='Mean K(f)', color='indigo')
-            ax.plot(f, gauss(f, m, b), label=f'Fit: m={m:.2f}, b={b:.2f}', color='red', ls='--')
-            ax.plot(f, m * f + b, label=f'Fit: m={m:.2f}, b={b:.2f}', color='red', ls='--')
+            ax.plot(f, np.exp(-s * f**2 / 2), label=f'Fit: s={s:.2f}', color='red', ls='--')
             ax.set_title(f"{sample}\n {current} pA, offset = {offset} V", fontsize=8)
             ax.legend(fontsize=7)
             ax.set_ylim(0, 1.4)
@@ -531,6 +542,27 @@ class BeamPlotter:
         fig.tight_layout()
         plt.savefig(self.output_path + '/K_fit_samples.jpeg', bbox_inches='tight')
         plt.close(fig)
+
+    def plot_s_vs_V(self):
+        d = self.df.dropna(subset=['K Fit Params']).drop_duplicates(['Sample', 'Current', 'Labeled Offset']).copy()
+        d['s'] = d['K Fit Params'].str[1]
+
+        pp = sns.relplot(data=d, kind='line', x='Labeled Offset', y='s', col='Current',
+                         marker='o', errorbar='sd', palette=['lightblue'])
+
+        V = np.linspace(d['Labeled Offset'].min(), d['Labeled Offset'].max(), 200)
+        for current, ax in pp.axes_dict.items():
+            a, b, c = self.df.loc[self.df['Current'] == current, 'sV Fit Params'].iloc[0]
+            ax.plot(V, a * V**2 + b * V + c, color='red', ls='--', label=f'a={a:.4f}, b={b:.4f}, c={c:.2f}')
+            ax.legend(fontsize=7)
+
+        pp.set_xlabels('Labeled Offset (V)')
+        pp.set_ylabels('s')
+        pp.set_titles('Current = {col_name}')
+        pp.figure.subplots_adjust(top=0.84)
+        pp.figure.suptitle('s vs Offset with Quadratic Fit')
+        pp.savefig(self.output_path + '/s_vs_V_fit.jpeg', bbox_inches='tight')
+        plt.close(pp.figure)
 
     def run(self):
 
@@ -548,11 +580,13 @@ class BeamPlotter:
         # offset_order = sorted(self.df.loc[self.df['Labeled Offset'] != 0, 'Labeled Offset'].dropna().unique())
         # self.plot_sample_norm_amp_profiles(offset_order, n_samples=3)
         # self.plot_sample_norm_energy_profiles(offset_order, n_samples=3)
-        # self.plot_samples(n_samples=3, random_state=1)
+        # self.plot_samples(n_samples=3, random_state=None)
         # self.plot_denoise(n_samples=6, random_state=None)
         self.plot_K_fits(n_samples=6, random_state=None)
 
+        # Plot models
         self.plot_K_params()
+        self.plot_s_vs_V()
 
 
 ##### main execution block #####
