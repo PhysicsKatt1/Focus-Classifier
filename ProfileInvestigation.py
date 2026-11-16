@@ -33,11 +33,24 @@ def scintallator_atten(f, v):
     return np.sqrt(0.91 / (1 + (2 * np.pi * f * v * 70e-9)**2) + (1 - 0.91) / (1 + (2 * np.pi * f * v * 300e-9)**2)) 
 
 def gauss(f, A, f0):
-    return A * np.exp(-f**2 / (2 * f0**2))
+    return  A * np.exp(-2 * np.pi**2 * f0**2 * f**2)  #A * np.exp(-f**2 / (2 * f0**2))
 
 def white_noise(C):
     # White noise has a frequency-independent power spectral density represented by constant power.
     return C
+
+def empirical_offset(metadata):
+    metadata = metadata.copy()
+    metadata['L2'] = pd.to_numeric(metadata['L2'], errors='coerce')
+    metadata['Empirical Offset'] = None
+
+
+    for _, group in metadata.groupby(['Current', 'Sample', 'File']):
+        focused = group.loc[group['Labeled Offset'] == 0, 'L2']
+        L2_focus = focused.iloc[0]
+        metadata.loc[group.index, 'Empirical Offset'] = (group['L2'] - L2_focus)
+
+    return metadata
 
 def Denoise(df, low=2.0, high=100.):
     df['PreDenoised Amplitude'] = df['Amplitude']
@@ -124,6 +137,7 @@ class PrepareImages():
             'Voltage': config['IBeam']['HV'],
             'Current': float(config['IBeam']['BeamCurrent']),
             'L2': xml_root.find('Optics/FibL2Voltage').text}
+
         return metadata
 
     def norm(self, dwell):
@@ -202,6 +216,7 @@ class BeamStats():
         valid = ((freq_raw >= self.freq_edges[0]) & (freq_raw < self.freq_edges[-1]) & (freq_raw < 1 / (2 * dx)))
         bin_index = bin_index[valid]
         energy_raw = energy_raw[valid]
+        energy_raw2 = energy_raw
         freq_raw = freq_raw[valid]
 
         # Count the number of FFT pixels in each frequency bin.
@@ -218,7 +233,7 @@ class BeamStats():
 
         # Calculate bin center frequencies, excluding zero frequency because the DC component has already been 
         # removed and does not represent physical beam structure.
-        return amp[1:], freq[1:], energy[1:], bin_counts[1:]
+        return amp[1:], freq[1:], energy[1:], bin_counts[1:], freq_raw, energy_raw2
 
     def run(self):
         return self.beam_profiles()
@@ -261,51 +276,157 @@ class SampNorm():
 
         return self.df
 
-    def fit_Kf(self, fmax=1.5):
+    def fit_Kf(self, fmax=1.2): 
         self.df['K Fit Params'] = None
+        self.df['K Fit s Err'] = None
+        self.df['K Fit R2'] = None
+        self.df['K Fit RMSE'] = None
+        self.df['Sigma Err'] = None
+        self.df['K Fit Good'] = False
 
-        d = self.df[self.df['Labeled Offset'] != 0]
-        for _, g in d.groupby(['Sample', 'Current', 'Labeled Offset']):
-            f = np.asarray(g.iloc[0]['Frequency'], dtype=float)
-            K = np.mean(np.stack(g['Sample Normalized Energy']), axis=0)
+        rows = []
+        for idx, row in self.df.iterrows():
+            if row['Labeled Offset'] == 0:
+                continue                                
+
+            f = np.asarray(row['Frequency'], dtype=float)
+            K = np.asarray(row['Sample Normalized Energy'], dtype=float)
             ok = (f <= fmax) & np.isfinite(K)
+            if ok.sum() < 3:
+                continue
 
             # f0 is the frequency where K has fallen to e^(−1/2) of A, so it measures how wide K is in frequency space.
             # A strongly blurred image kills high frequencies, so K is narrow and f0 is small. As blur shrinks toward 
             # zero, K gets wider, so f0 grows and goes to infinity when there is no blur at all. Fitting f0 near 
             # focus means the optimizer is chasing a parameter that runs off to infinity. Instead, fitting s = 1 /f0^2
-            # lets s -> 0 as f0 -> inf, thereby allowing the optimizer to fit near focus.
-            # We fix the Gaussian amplitude at 1.0 since focus / focus = 1.0 and since K(0) = 1 by convention
-            # and because a common amplitude is required for an apples to apples comparison of how the Gaussian 
-            # std changes with voltage offset. Also, σ_f = FWHM / (2√(2 ln 2)) ≈ FWHM / 2.3548
-            # where σ_f = f0 = 1/√s. Since s = 1/σ_f², the initial guess for s is  s₀ = 8 ln 2 / FWHM².
+            # lets s -> 0 as f0 -> inf, thereby allowing the optimizer to fit near focus. Also,
+            #  σ_f = FWHM / (2√(2 ln 2)) ≈ FWHM / 2.3548 where σ_f = f0 = 1/√s. Since s = 1/σ_f², the initial 
+            # guess for s is  s₀ = 8 ln 2 / FWHM².
             half = K[ok] <= 0.5 * K[ok].max()
             f_half = f[ok][half][0] if half.any() else f[ok].max()
             s0 = 8 * np.log(2) / (2 * f_half)**2
-            
-            popt, _ = curve_fit(lambda f, s: 1.0 * np.exp(-s * f**2 / 2), f[ok], K[ok],
-                               p0=[s0], sigma=K[ok], bounds=((0), (np.inf)))
 
-            for idx in g.index:
-                self.df.at[idx, 'K Fit Params'] = popt.tolist()
+            popt, cov = curve_fit(lambda f, A, s: A * np.exp(-s * f**2 / 2), f[ok], K[ok],
+                      p0=[1.0, s0], bounds=((0, 0), (np.inf, np.inf)))
 
-    def fit_s_vs_V(self):
-        self.df['sV Fit Params'] = None
+            err = np.sqrt(np.diag(cov))
+            pred = popt[0] * np.exp(-popt[1] * f[ok]**2 / 2)
+            res = K[ok] - pred
+            r2 = 1 - np.sum(res**2) / np.sum((K[ok] - K[ok].mean())**2)
+            rmse = np.sqrt(np.sum(res**2) / len(K[ok]))
 
-        d = self.df.dropna(subset=['K Fit Params']).drop_duplicates(['Sample', 'Current', 'Labeled Offset']).copy()
-        d['s'] = d['K Fit Params'].str[1]
+            sigma = 1e3 * np.sqrt(max(popt[1], 0)) / (2 * np.sqrt(2) * np.pi)
+            sigma_err = 1e3 * err[1] / (4 * np.sqrt(2) * np.pi * np.sqrt(popt[1])) if popt[1] > 0 else np.nan
+            good = bool(rmse < 0.1 and r2 > 0.95)
 
-        for current, g in d.groupby('Current'):
-            m = g.groupby('Labeled Offset')['s'].mean()
-            popt, _ = curve_fit(lambda V, a, b, c: a * V**2 + b * V + c, m.index.values, m.values)
+            rows.append({'Sample': row['Sample'], 'File': row['File'], 'Current': row['Current'],
+                         'Labeled Offset': row['Labeled Offset'], 'Empirical Offset': row['Empirical Offset'],
+                         'Image': row['Image'],'A': popt[0], 'A Err': err[0], 's': popt[1], 's Err': err[1],
+                         'sigma (nm)': sigma, 'Sigma Err': sigma_err, 'R2': r2, 'RMSE': rmse, 'Good': good})
 
-            for idx in self.df.index[self.df['Current'] == current]:
-                self.df.at[idx, 'sV Fit Params'] = popt.tolist()
+            self.df.at[idx, 'K Fit Params'] = popt.tolist()
+            self.df.at[idx, 'K Fit s Err'] = err[1]
+            self.df.at[idx, 'K Fit R2'] = r2
+            self.df.at[idx, 'K Fit Good'] = good
+            self.df.at[idx, 'K Fit RMSE'] = rmse
+            self.df.at[idx, 'Sigma Err'] = sigma_err
 
+
+        self.K_table = pd.DataFrame(rows)
+
+        return self.df
+
+    def fit_sigma_vs_dV(self):
+        d = self.K_table[self.K_table['Good'].astype(bool)].copy()
+        rows = []
+
+        def hyperbolic(V, kappa, dirac):
+            return np.sqrt((kappa * V)**2 + dirac**2)
+
+        for (current, sample), g in d.groupby(['Current', 'Sample']):
+            V = pd.to_numeric(g['Empirical Offset'], errors='coerce').to_numpy(dtype=float)
+            sigma = pd.to_numeric(g['sigma (nm)'], errors='coerce').to_numpy(dtype=float)
+            se = g['Sigma Err'].to_numpy(float)
+
+            valid = np.isfinite(V) & np.isfinite(sigma)
+            V = V[valid]
+            sigma = sigma[valid]
+
+            if len(V) < 3 or len(np.unique(V)) < 2:
+                continue
+
+            dirac0 = max(0., sigma.min())
+            kappa0 = np.sqrt(max(sigma.max()**2 - dirac0**2, 0.)) / np.max(np.abs(V))
+
+            popt, cov = curve_fit(hyperbolic, V, sigma, sigma = se, p0=[kappa0, dirac0], bounds=((0., 0.), (np.inf, np.inf)),
+                                  max_nfev=10000)
+
+            err = np.sqrt(np.diag(cov))
+            pred = hyperbolic(V, *popt)
+            res = sigma - pred
+            r2 = 1 - np.sum(res**2) / np.sum((sigma - sigma.mean())**2)
+            rmse = np.sqrt(np.mean((res / se)**2))
+
+            rows.append({'Sample': sample, 'Current': current, 'kappa': popt[0], 'kappa Err': err[0],
+                         'dirac': popt[1], 'dirac Err': err[1], 'N': len(V), 'R2': r2, 'RMSE': rmse})
+
+        self.sigma_table = pd.DataFrame(rows)
+        self.sigma_table.to_csv(path + outputs + '/sigma_vs_dV_fit_stats.csv', index=False)
+
+        return self.sigma_table
+
+    def focal_point(self, wd_um = 4030):
+        # First-order weak symmetric Einzel lens: 1/f = C * (L2 / V_beam)^2.
+        # C is fixed per Current by requiring f = wd_um at the mean focused L2.
+        self.df['L2'] = pd.to_numeric(self.df['L2'], errors='coerce')
+        self.df['Voltage'] = pd.to_numeric(self.df['Voltage'], errors='coerce')
+        self.df['Focal Point (um)'] = np.nan
+        self.df['Focal Point Differential (um)'] = np.nan
+
+        for current, g in self.df.groupby('Current'):
+            V_focus = g.loc[g['Labeled Offset'] == 0, 'L2'].mean()
+            C = (1 / wd_um) * (g['Voltage'] / V_focus)**2
+            self.df.loc[g.index, 'Focal Point (um)'] = 1 / (C * (g['L2'] / g['Voltage'])**2)
+
+        for _, g in self.df.groupby(['Sample', 'Current', 'File']):
+            z_focused = g.loc[g['Labeled Offset'] == 0, 'Focal Point (um)'].iloc[0]
+            self.df.loc[g.index, 'Focal Point Differential (um)'] = g['Focal Point (um)'] - z_focused
+
+        return self.df
+
+    def fit_focal_point_vs_dV(self):
+        d = self.df.copy()
+        d['dV'] = pd.to_numeric(d['Empirical Offset'], errors='coerce')
+        d = d[d['Labeled Offset'] != 0].dropna(subset=['dV', 'Focal Point Differential (um)'])
+        rows = []
+
+        def quad(V, m, q):
+            return m * V + q * V**2
+
+        for (sample, current), g in d.groupby(['Sample', 'Current']):
+            if g['dV'].nunique() < 3:
+                continue
+            V = g['dV'].to_numpy(float)
+            z = g['Focal Point Differential (um)'].to_numpy(float)
+            popt, cov = curve_fit(quad, V, z)
+            err = np.sqrt(np.diag(cov))
+            res = z - quad(V, *popt)
+            rows.append({'Sample': sample, 'Current': current, 'N': len(V),
+                        'dz/dV (um/V)': popt[0], 'dz/dV Err': err[0],
+                        'q (um/V^2)': popt[1], 'q Err': err[1],
+                        'R2': 1 - np.sum(res**2) / np.sum((z - z.mean())**2),
+                        'RMSE (um)': np.sqrt(np.mean(res**2))})
+
+        self.focal_table = pd.DataFrame(rows)
+        self.focal_table.to_csv(path + outputs + '/focal_point_vs_dV_fit_stats.csv', index=False)
+ 
     def run(self):
         self.df = self.SampleNormalized()
         self.fit_Kf()
-        self.fit_s_vs_V()
+        self.fit_sigma_vs_dV()
+        self.K_table.to_csv(path + outputs + '/K_fit_stats.csv', index=False)
+        self.focal_point()
+        self.fit_focal_point_vs_dV()
 
         return self.df
 
@@ -427,6 +548,8 @@ class BeamPlotter:
                              col='Current', palette='cool', alpha=0.85, linewidth=1.2)
 
             pp.set_xlabels('Spatial Frequency (cycles/µm)')
+            for ax in pp.axes.flat:
+                ax.set_xlim(0., 2.)
             pp.set_ylabels('Mean Magnitude Squared per Frequency Bin')
             pp.set_titles('Current = {col_name}')
             pp.figure.subplots_adjust(top=0.84)
@@ -451,8 +574,8 @@ class BeamPlotter:
             clean = np.asarray(row['Energy'], dtype=float)
             N = np.asarray(row['Noise Floor'], dtype=float)
 
-            ax.plot(f, raw, label='Original', color='darkturquoise')
-            ax.plot(f, clean, label='Denoised', color='indigo')
+            ax.plot(f, raw, label='Original', color='indigo')
+            ax.plot(f, clean, label='Denoised', color='darkturquoise', ls = '*-')
             ax.plot(f, N, label='Noise', color='red', ls='--')
             ax.set_yscale('log')
             ax.set_title(f"{row['Sample']} File {row['File']}\n {row['Current']} pA, offset = {row['Labeled Offset']} V",
@@ -496,41 +619,27 @@ class BeamPlotter:
             pp.savefig(self.output_path + f'/Sample_{sample}_{file}.jpeg', bbox_inches='tight')
             plt.close(pp.figure)
 
-    def plot_K_params(self):
-        d = self.df.dropna(subset=['K Fit Params']).drop_duplicates(['Sample', 'Current', 'Labeled Offset']).copy()
-        d['s'] = d['K Fit Params'].str[1]
-
-        for p in ['s']:
-            pp = sns.relplot(data=d, kind='line', x='Labeled Offset', y=p, col='Current',
-                            marker='o', errorbar='sd',  palette=['lightblue'])
-            pp.set_xlabels('Labeled Offset (V)')
-            pp.set_ylabels(p)
-            pp.set_titles('Current = {col_name}')
-            pp.figure.subplots_adjust(top=0.84)
-            pp.figure.suptitle(f'K(f) Gaussian Fit: {p} vs Offset')
-            pp.savefig(self.output_path + f'/K_fit_{p}.jpeg', bbox_inches='tight')
-            plt.close(pp.figure)
-
     def plot_K_fits(self, n_samples, random_state=None):
         d = self.df.dropna(subset=['K Fit Params'])
-        groups = list(d.groupby(['Sample', 'Current', 'Labeled Offset']))
         rng = np.random.default_rng(random_state)
-        picks = rng.choice(len(groups), size=min(n_samples, len(groups)), replace=False)
+        picks = rng.choice(len(d), size=min(n_samples, len(d)), replace=False)
 
         ncols = min(3, len(picks))
         nrows = int(np.ceil(len(picks) / ncols))
         fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.8 * nrows),
-                                sharex=True, squeeze=False)
+                                 sharex=True, squeeze=False)
 
         for ax, i in zip(axes.ravel(), picks):
-            (sample, current, offset), g = groups[i]
-            f = np.asarray(g.iloc[0]['Frequency'], dtype=float)
-            K = np.mean(np.stack(g['Sample Normalized Energy']), axis=0)
-            s = g.iloc[0]['K Fit Params']
+            row = d.iloc[i]
+            f = np.asarray(row['Frequency'], dtype=float)
+            K = np.asarray(row['Sample Normalized Energy'], dtype=float)
+            A, s = row['K Fit Params']
 
-            ax.plot(f, K, label='Mean K(f)', color='indigo')
-            ax.plot(f, np.exp(-s * f**2 / 2), label=f'Fit: s={s:.2f}', color='red', ls='--')
-            ax.set_title(f"{sample}\n {current} pA, offset = {offset} V", fontsize=8)
+            ax.plot(f, K, label='K(f)', color='indigo')
+            ax.plot(f, A * np.exp(-s * f**2 / 2), color='darkturquoise', ls='--',
+                    label=f'Fit: A={A:.2f}, s={s:.2f}, R2={row["K Fit R2"]:.2f}, RMSE={row["K Fit RMSE"]:.2f}')
+            ax.set_title(f"{row['Sample']} File {row['File']}\n {row['Current']} pA, offset = "
+                         f"{row['Labeled Offset']} V, Measured: {row['Empirical Offset']} V", fontsize=8)
             ax.legend(fontsize=7)
             ax.set_ylim(0, 1.4)
 
@@ -543,29 +652,85 @@ class BeamPlotter:
         plt.savefig(self.output_path + '/K_fit_samples.jpeg', bbox_inches='tight')
         plt.close(fig)
 
-    def plot_s_vs_V(self):
-        d = self.df.dropna(subset=['K Fit Params']).drop_duplicates(['Sample', 'Current', 'Labeled Offset']).copy()
-        d['s'] = d['K Fit Params'].str[1]
+    def plot_sigma_vs_dV(self):
+        d = pd.read_csv(self.output_path + '/K_fit_stats.csv')
+        fits = pd.read_csv(self.output_path + '/sigma_vs_dV_fit_stats.csv')
+        d = d[d['Good'].astype(bool)].copy()
+        currents = sorted(d['Current'].unique())
+        ncols = min(3, len(currents))
+        nrows = int(np.ceil(len(currents) / ncols))
+        palette = sns.color_palette('cool', n_colors=d['Sample'].nunique())
 
-        pp = sns.relplot(data=d, kind='line', x='Labeled Offset', y='s', col='Current',
-                         marker='o', errorbar='sd', palette=['lightblue'])
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows),
+                                 sharex=True, sharey=True, squeeze=False)
 
-        V = np.linspace(d['Labeled Offset'].min(), d['Labeled Offset'].max(), 200)
-        for current, ax in pp.axes_dict.items():
-            a, b, c = self.df.loc[self.df['Current'] == current, 'sV Fit Params'].iloc[0]
-            ax.plot(V, a * V**2 + b * V + c, color='red', ls='--', label=f'a={a:.4f}, b={b:.4f}, c={c:.2f}')
-            ax.legend(fontsize=7)
+        for ax, current in zip(axes.flat, currents):
+            current_data = d[d['Current'] == current]
+            current_fits = fits[fits['Current'] == current]
 
-        pp.set_xlabels('Labeled Offset (V)')
-        pp.set_ylabels('s')
-        pp.set_titles('Current = {col_name}')
-        pp.figure.subplots_adjust(top=0.84)
-        pp.figure.suptitle('s vs Offset with Quadratic Fit')
-        pp.savefig(self.output_path + '/s_vs_V_fit.jpeg', bbox_inches='tight')
-        plt.close(pp.figure)
+            for color, (sample, g) in zip(palette, current_data.groupby('Sample')):
+                V = np.asarray(g['Empirical Offset'], dtype=float)
+                sigma = np.asarray(g['sigma (nm)'], dtype=float)
+
+                ax.scatter(V, sigma, color=color, alpha=0.75, s=35, label=sample)
+                fit = current_fits[current_fits['Sample'] == sample]
+                if len(fit) == 0:
+                    continue
+
+                kappa = float(fit['kappa'].iloc[0])
+                dirac = float(fit['dirac'].iloc[0])
+                V_fit = np.linspace(V.min(), V.max(), 200)
+                sigma_fit = np.sqrt((kappa * V_fit)**2 + dirac**2)
+
+                ax.plot(V_fit, sigma_fit, color=color, linewidth=1.5)
+
+            ax.set_title('Current = ' + str(current))
+            ax.legend(title='Sample')
+            ax.grid(alpha=0.25)
+
+        for ax in axes.flat[len(currents):]:
+            ax.set_visible(False)
+
+        fig.supxlabel('Empirical Voltage Differential (V)')
+        fig.supylabel('Gaussian Sigma (nm)')
+        fig.suptitle('Defocus Effect on the Observed Gaussian Kernel Width')
+        fig.tight_layout()
+        fig.savefig(self.output_path + '/Sigma_vs_dV.jpeg', bbox_inches='tight')
+        plt.close(fig)
+
+    def plot_focal_point_vs_dV(self):
+        d = self.df.copy()
+        d['dV'] = pd.to_numeric(d['Empirical Offset'], errors='coerce')
+        d = d[d['Labeled Offset'] != 0].dropna(subset=['dV', 'Focal Point Differential (um)'])
+        fits = pd.read_csv(self.output_path + '/focal_point_vs_dV_fit_stats.csv')
+        currents = sorted(d['Current'].unique())
+        ncols = min(3, len(currents))
+        nrows = int(np.ceil(len(currents) / ncols))
+        palette = sns.color_palette('cool', n_colors=d['Sample'].nunique())
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+        for ax, current in zip(axes.flat, currents):
+            for color, (sample, g) in zip(palette, d[d['Current'] == current].groupby('Sample')):
+                ax.scatter(g['dV'], g['Focal Point Differential (um)'], color=color, alpha=0.75, s=35, label=sample)
+                fit = fits[(fits['Sample'] == sample) & (fits['Current'] == current)]
+                if len(fit) == 0:
+                    continue
+                V = np.linspace(g['dV'].min(), g['dV'].max(), 200)
+                ax.plot(V, fit['dz/dV (um/V)'].iloc[0] * V + fit['q (um/V^2)'].iloc[0] * V**2, color=color, lw=1.5)
+            ax.set_title('Current = ' + str(current))
+            ax.legend(title='Sample')
+            ax.grid(alpha=0.25)
+
+        for ax in axes.flat[len(currents):]:
+            ax.set_visible(False)
+        fig.supxlabel('Empirical Offset (V)')
+        fig.supylabel('Focal Point Differential (µm)')
+        fig.suptitle('Focal Point Displacement vs L2 Offset')
+        fig.tight_layout()
+        fig.savefig(self.output_path + '/Focal_Point_vs_dV.jpeg', bbox_inches='tight')
+        plt.close(fig)
 
     def run(self):
-
         # Plot means.
         self.plot_means('Frequency', 'Amplitude', 'Magnitude',
                         'Mean Spatial Frequency Distribution', '/Mean_Frequency_Profiles.jpeg')
@@ -583,11 +748,11 @@ class BeamPlotter:
         # self.plot_samples(n_samples=3, random_state=None)
         # self.plot_denoise(n_samples=6, random_state=None)
         self.plot_K_fits(n_samples=6, random_state=None)
+        
 
         # Plot models
-        self.plot_K_params()
-        self.plot_s_vs_V()
-
+        self.plot_sigma_vs_dV()
+        self.plot_focal_point_vs_dV()
 
 ##### main execution block #####
 images = []
@@ -620,11 +785,14 @@ for processor, sample, file, image in tqdm(images, desc='Processing images'):
     os.makedirs(path + outputs + '/' + sample + '/' + file, exist_ok=True)
 
     metadata, im, im_fft = processor.run()
-    amp, freq, energy, bin_counts = BeamStats(im, metadata.iloc[0], freq_max, max_step).run()
+    # metadata['FFT'] = [im_fft]
 
+    amp, freq, energy, bin_counts, freq_raw,  energy_raw2 = BeamStats(im, metadata.iloc[0], freq_max, max_step).run()
     metadata['Amplitude'] = [amp.tolist()]
     metadata['Frequency'] = [freq.tolist()]
+    # metadata['Frequency Raw'] = [freq_raw.tolist()]
     metadata['Energy'] = [energy.tolist()]
+    # metadata['Energy Raw'] = [energy_raw2.tolist()]
     metadata['Energy Bin Counts'] = [bin_counts.tolist()]
     meta.append(metadata)
 
@@ -636,6 +804,7 @@ for processor, sample, file, image in tqdm(images, desc='Processing images'):
     '''
 ##### aggregate metadata #####
 all_metadata = pd.concat(meta, ignore_index=True)
+all_metadata = empirical_offset(all_metadata)
 
 # #### cleaning data #####
 # print('Cleaning data.')
