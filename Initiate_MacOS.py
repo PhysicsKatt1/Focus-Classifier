@@ -40,10 +40,11 @@ BEAM_TOKENS = ['30000.0V_0.09nA', '30000.0V_0.041nA', '30000.0V_0.75nA']
 
 # Folder layout (relative to BASE). Edit here if your structure differs.
 INPUT_DIR = BASE / 'Inputs'
-FOCUSED_DIR = BASE / 'Focused'            # Focused/<beam condition>/
-DEFOCUSED_DIR = BASE / 'Defocused'        # Defocused/<beam condition>/
-UNMATCHED_DIR = BASE / 'Unmatched'        # images whose filename matches no beam condition
-ERROR_DIR = BASE / 'Errors'               # images that raised an exception
+OUTPUT_DIR = BASE / 'Outputs'
+FOCUSED_DIR = OUTPUT_DIR / 'Focused'            # Outputs/Focused/<beam condition>/
+DEFOCUSED_DIR = OUTPUT_DIR / 'Defocused'        # Outputs/Defocused/<beam condition>/
+UNMATCHED_DIR = OUTPUT_DIR / 'Unmatched'        # images whose filename matches no beam condition
+ERROR_DIR = OUTPUT_DIR / 'Errors'               # images that raised an exception
 MODEL_PATH = BASE / 'UNet_3.1.keras'
 RUN_CSV = BASE / 'runData.csv'
 FOCAL_FIT_CSV = BASE / 'focal_point_vs_dV_fit_stats.csv'    # output of the analysis script
